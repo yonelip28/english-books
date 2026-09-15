@@ -1,0 +1,16 @@
+# If the project already has a netlify.toml, merge this [[redirects]] block
+# into it instead of replacing the whole file — don't have two netlify.toml
+# files with conflicting settings.
+
+# Makes "/api/fetch-article" (the path index.html actually calls) resolve to
+# the Netlify Function at netlify/functions/fetch-article.js. Using "/api/..."
+# instead of calling "/.netlify/functions/fetch-article" directly from the
+# client means the same client-side path also works unmodified on Vercel and
+# Cloudflare Pages, which both use "/api/..." as their own native convention
+# — so a future move off Netlify only means deploying the matching function
+# file for that platform (see the commented-out equivalents at the bottom of
+# fetch-article.js), never touching index.html again.
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
