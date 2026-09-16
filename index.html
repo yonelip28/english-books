@@ -1641,6 +1641,17 @@ async function firestoreSet(config, path, fields) {
   return res.json();
 }
 
+async function firestoreDelete(config, path) {
+  const token = await getGoogleIdToken(config);
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const res = await fetch(`${firestoreBaseUrl(config)}/${path}?key=${encodeURIComponent(config.apiKey)}`, {
+    method: "DELETE",
+    headers,
+  });
+  // 404 just means it's already gone — fine for a delete, not an error.
+  if (!res.ok && res.status !== 404) throw new Error(friendlyFirestoreError(res.status, true));
+}
+
 function strField(v) {
   return { stringValue: v };
 }
@@ -2605,6 +2616,33 @@ async function pushStoryToPublicLibrary(story) {
 // well under that (comfortably under even after base64, which adds ~33%).
 const PDF_FILE_CHUNK_RAW_BYTES = 650000;
 
+// Each chunk (and its "meta" doc recording how many chunks exist) lives in
+// a subcollection literally named "pdf_chunks", with each document's own id
+// spelling out exactly what it is — "{storyId}_{index}" for a chunk,
+// "{storyId}_meta" for the count — e.g. a full path reads
+// public_library/{storyId}/pdf_chunks/{storyId}_0. Kept as a subcollection
+// UNDER the story's existing document (rather than one giant flat top-level
+// collection) so it stays covered by whichever Firestore security rule
+// already scopes that parent path (see BackupSettingsPanel's rules
+// snippet for the reader_backups/{uid}/{document=**} rule in particular) —
+// a flat collection would need its own new rule to actually be reachable.
+const PDF_CHUNKS_SUBCOLLECTION = "pdf_chunks";
+// Books imported before this naming existed pushed their chunks under a
+// bare "pdfFile" subcollection with plain numeric doc ids (0, 1, 2, ...
+// "meta") instead. fetchFileChunks below still knows how to fall back to
+// that shape, so nothing already in the cloud needs migrating.
+const PDF_CHUNKS_LEGACY_SUBCOLLECTION = "pdfFile";
+
+// Compression level for pako.gzip on the original PDF bytes. Level 9 is
+// pako's slowest setting but squeezes out the most bytes — deliberately
+// chosen over the faster defaults: the pooled backup budget is a hard
+// ~3GB total (see CLOUD_BACKEND_CONFIGS, 3 pooled 1GiB-free-tier Firestore
+// projects), a fixed ceiling that many readers share, while a bit of extra
+// client-side CPU time during import/restore costs nothing but a few
+// seconds on one device. Trading a little more loading time for
+// meaningfully less consumed storage is the right tradeoff here.
+const PDF_GZIP_OPTIONS = { level: 9 };
+
 function uint8ToBase64(bytes) {
   let binary = "";
   const step = 0x8000; // avoid a giant call stack from String.fromCharCode(...bytes)
@@ -2628,38 +2666,75 @@ function base64ToUint8(b64) {
 // there is nothing new to send. This is the "no duplicate file upload"
 // behavior: only a file that doesn't already exist in the cloud gets
 // pushed at all.
-async function pushFileChunksIfMissing(config, basePath, compressedBytes) {
-  const existingMeta = await firestoreGet(config, `${basePath}/meta`);
-  if (existingMeta) return; // already uploaded — nothing to do
+// basePath is the story's own subcollection path (e.g.
+// `public_library/{storyId}/pdf_chunks`) — storyId is passed separately
+// purely to build the self-describing "{storyId}_{index}" doc ids described
+// above. Returns the number of compressed bytes actually written this call
+// (0 if the file was already there and nothing new was sent) so callers can
+// feed it into the pooled storage-usage estimate (see addProjectBytes).
+async function pushFileChunksIfMissing(config, basePath, storyId, compressedBytes) {
+  const metaPath = `${basePath}/${storyId}_meta`;
+  const existingMeta = await firestoreGet(config, metaPath);
+  if (existingMeta) return 0; // already uploaded — nothing to do
   const chunkCount = Math.max(1, Math.ceil(compressedBytes.length / PDF_FILE_CHUNK_RAW_BYTES));
   for (let i = 0; i < chunkCount; i++) {
     const slice = compressedBytes.subarray(i * PDF_FILE_CHUNK_RAW_BYTES, (i + 1) * PDF_FILE_CHUNK_RAW_BYTES);
-    await firestoreSet(config, `${basePath}/${i}`, { data: strField(uint8ToBase64(slice)) });
+    await firestoreSet(config, `${basePath}/${storyId}_${i}`, { data: strField(uint8ToBase64(slice)) });
   }
-  await firestoreSet(config, `${basePath}/meta`, { chunkCount: intField(chunkCount) });
+  await firestoreSet(config, metaPath, { chunkCount: intField(chunkCount) });
+  return compressedBytes.length;
 }
 
 // Downloads and reassembles a file previously pushed by pushFileChunksIfMissing,
 // returning its original (decompressed) bytes, or null if it isn't there /
 // is incomplete.
-async function fetchFileChunks(config, basePath) {
-  const meta = await firestoreGet(config, `${basePath}/meta`);
+// Tries the current pdf_chunks/{storyId}_{index} naming first; if there's
+// no meta doc there, falls back to the legacy bare "pdfFile" subcollection
+// with plain numeric doc ids (0, 1, 2, ... "meta") that older imports used —
+// see PDF_CHUNKS_LEGACY_SUBCOLLECTION — so nothing uploaded before this
+// naming existed needs migrating to stay downloadable. legacyBasePath may be
+// omitted by a caller that knows only the new shape can apply.
+async function fetchFileChunks(config, basePath, storyId, legacyBasePath) {
+  let meta, idFor;
+  try {
+    meta = await firestoreGet(config, `${basePath}/${storyId}_meta`);
+    idFor = (i) => `${basePath}/${storyId}_${i}`;
+    if (!meta && legacyBasePath) {
+      meta = await firestoreGet(config, `${legacyBasePath}/meta`);
+      idFor = (i) => `${legacyBasePath}/${i}`;
+    }
+  } catch (e) {
+    console.error("fetchFileChunks: reading meta failed:", (e && e.message) || e, { storyId });
+    return null;
+  }
   const chunkCount = meta && meta.fields && meta.fields.chunkCount && Number(meta.fields.chunkCount.integerValue);
   if (!chunkCount) return null;
-  const parts = [];
-  let totalLen = 0;
-  for (let i = 0; i < chunkCount; i++) {
-    const doc = await firestoreGet(config, `${basePath}/${i}`);
-    const b64 = doc && doc.fields && doc.fields.data && doc.fields.data.stringValue;
-    if (!b64) return null; // incomplete upload — treat as unavailable rather than return a corrupt file
-    const bytes = base64ToUint8(b64);
-    parts.push(bytes);
-    totalLen += bytes.length;
+  try {
+    const parts = [];
+    let totalLen = 0;
+    for (let i = 0; i < chunkCount; i++) {
+      const doc = await firestoreGet(config, idFor(i));
+      const b64 = doc && doc.fields && doc.fields.data && doc.fields.data.stringValue;
+      if (!b64) {
+        // Incomplete upload — treat as unavailable rather than return a
+        // corrupt file, but make sure this is visible somewhere: silently
+        // returning null here with no trace made a partial/interrupted
+        // upload indistinguishable from "never uploaded at all".
+        console.error(`fetchFileChunks: chunk ${i}/${chunkCount} missing for story ${storyId} — treating upload as incomplete.`);
+        return null;
+      }
+      const bytes = base64ToUint8(b64);
+      parts.push(bytes);
+      totalLen += bytes.length;
+    }
+    const compressed = new Uint8Array(totalLen);
+    let offset = 0;
+    parts.forEach((p) => { compressed.set(p, offset); offset += p.length; });
+    return pako.ungzip(compressed);
+  } catch (e) {
+    console.error("fetchFileChunks: downloading/reassembling chunks failed:", (e && e.message) || e, { storyId });
+    return null;
   }
-  const compressed = new Uint8Array(totalLen);
-  let offset = 0;
-  parts.forEach((p) => { compressed.set(p, offset); offset += p.length; });
-  return pako.ungzip(compressed);
 }
 
 // Returns true if the file is already in the cloud (or was just uploaded
@@ -2672,8 +2747,22 @@ async function pushPdfFileToPublicCloud(storyId, pdfBytes) {
   if (!config) return false;
   try {
     getGoogleUser(config) || (await signInSilentlyWithCredential(config)); // best-effort, same as pushStoryToPublicLibrary — no popup
-    const compressed = pako.gzip(pdfBytes);
-    await pushFileChunksIfMissing(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/pdfFile`, compressed);
+    const compressed = pako.gzip(pdfBytes, PDF_GZIP_OPTIONS);
+    const bytesWritten = await pushFileChunksIfMissing(
+      config,
+      `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/${PDF_CHUNKS_SUBCOLLECTION}`,
+      storyId,
+      compressed
+    );
+    if (bytesWritten && isPooledMode()) {
+      // The public catalog always lives on the primary/registry project
+      // (see publicLibraryConfig) — the same project pooled private
+      // backups can also land on. Without this, that project's usage
+      // estimate silently ignores everything the public catalog itself
+      // writes there, and it keeps getting handed new readers even once
+      // it's actually filling up from shared PDF uploads.
+      await addProjectBytes(getActiveProjectConfigs()[0], config.projectId, bytesWritten);
+    }
     return true;
   } catch (e) {
     // Best-effort, exactly like pushStoryToPublicLibrary above — the
@@ -2682,7 +2771,7 @@ async function pushPdfFileToPublicCloud(storyId, pdfBytes) {
     // function, our callers DO need to know about the failure (to avoid
     // marking this book as pushed when it wasn't) — hence returning false
     // instead of just swallowing it.
-    console.error("pushPdfFileToPublicCloud failed:", (e && e.message) || e);
+    console.error("pushPdfFileToPublicCloud failed:", (e && e.message) || e, { storyId });
     return false;
   }
 }
@@ -2696,8 +2785,14 @@ async function fetchPdfFileFromPublicCloud(storyId) {
   const config = publicLibraryConfig();
   if (!config) return null;
   try {
-    return await fetchFileChunks(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/pdfFile`);
+    return await fetchFileChunks(
+      config,
+      `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/${PDF_CHUNKS_SUBCOLLECTION}`,
+      storyId,
+      `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/${PDF_CHUNKS_LEGACY_SUBCOLLECTION}`
+    );
   } catch (e) {
+    console.error("fetchPdfFileFromPublicCloud failed:", (e && e.message) || e, { storyId });
     return null;
   }
 }
@@ -2712,22 +2807,42 @@ async function fetchPdfFileFromPublicCloud(storyId) {
 // is recursive over everything nested under the reader's own uid.
 async function pushPdfFileToBackupCloud(config, docId, storyId, pdfBytes) {
   try {
-    const compressed = pako.gzip(pdfBytes);
-    await pushFileChunksIfMissing(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/pdfFile`, compressed);
+    const compressed = pako.gzip(pdfBytes, PDF_GZIP_OPTIONS);
+    const bytesWritten = await pushFileChunksIfMissing(
+      config,
+      `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/${PDF_CHUNKS_SUBCOLLECTION}`,
+      storyId,
+      compressed
+    );
+    if (bytesWritten && isPooledMode()) {
+      // Count these bytes against the TARGET project's own quota estimate
+      // (config here may be a different pooled project than the registry),
+      // recorded on the registry project's stats collection — see
+      // addProjectBytes. Without this, a reader who imports several large
+      // PDFs could quietly push their assigned project well past its real
+      // free-tier limit before the pool ever notices it's full.
+      await addProjectBytes(getActiveProjectConfigs()[0], config.projectId, bytesWritten);
+    }
     return true;
   } catch (e) {
     // Best-effort, same as the public-catalog version — the reader's own
     // local copy (IndexedDB) already has everything regardless. But the
     // caller still needs to know this failed, so it doesn't mark the book
     // as backed-up when it isn't — hence returning false here.
-    console.error("pushPdfFileToBackupCloud failed:", (e && e.message) || e);
+    console.error("pushPdfFileToBackupCloud failed:", (e && e.message) || e, { storyId, docId });
     return false;
   }
 }
 async function fetchPdfFileFromBackupCloud(config, docId, storyId) {
   try {
-    return await fetchFileChunks(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/pdfFile`);
+    return await fetchFileChunks(
+      config,
+      `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/${PDF_CHUNKS_SUBCOLLECTION}`,
+      storyId,
+      `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/${PDF_CHUNKS_LEGACY_SUBCOLLECTION}`
+    );
   } catch (e) {
+    console.error("fetchPdfFileFromBackupCloud failed:", (e && e.message) || e, { storyId, docId });
     return null;
   }
 }
@@ -2749,7 +2864,85 @@ async function fetchPdfFileFromPersonalBackup(storyId) {
     if (!targetIdentity) return null;
     return await fetchPdfFileFromBackupCloud(targetConfig, targetIdentity.uid, storyId);
   } catch (e) {
+    console.error("fetchPdfFileFromPersonalBackup failed:", (e && e.message) || e, { storyId });
     return null;
+  }
+}
+
+// Mirrors fetchPdfFileFromPersonalBackup's identity resolution, but to PUSH
+// this reader's own private backup copy of a freshly-imported PDF file
+// immediately (see backupImportedPdfNow) instead of waiting for the next
+// full, debounced auto-backup pass. That full pass still covers this book
+// too, as a safety net — see the importedIds retry loop inside
+// pushBackupFirebase — in case this immediate attempt fails, or auto-backup
+// was switched off at the moment of import.
+async function pushPdfFileToPersonalBackupNow(storyId, pdfBytes) {
+  const config = getCloudConfig();
+  if (!config) return true; // Netlify mode: no per-file push path — the single whole-state blob backup covers it instead, nothing missing here
+  try {
+    const registryIdentity = await ensureGoogleSignedIn(undefined, false); // never pops a sign-in window
+    if (!registryIdentity) return true; // not signed in yet — the periodic full backup will pick this book up once the reader connects
+    const targetConfig = await resolveBackupProject(registryIdentity, undefined, true);
+    const targetIdentity = await identityForProject(registryIdentity, targetConfig, undefined, false);
+    if (!targetIdentity) return true;
+    return await pushPdfFileToBackupCloud(targetConfig, targetIdentity.uid, storyId, pdfBytes);
+  } catch (e) {
+    console.error("pushPdfFileToPersonalBackupNow failed:", (e && e.message) || e, { storyId });
+    return false;
+  }
+}
+
+// Runs right after a PDF import finishes (see importPdfStory) — pushes the
+// ORIGINAL FILE to every cloud destination it belongs in, immediately and
+// in the background, instead of relying only on the debounced general
+// auto-backup (which may be switched off, or simply hasn't fired yet).
+// Never silent about failure: every failed destination is logged to the
+// console with real detail, and — whenever a cloud destination is actually
+// configured — reflected in the visible sync status line, so a reader
+// importing a big book is never left thinking it's safely backed up when it
+// isn't. A failure here doesn't block reading (the reader is already
+// reading chapter 1 locally either way) and is always retried automatically
+// on the next full backup pass regardless — see the PDF_CHAPTERS_*_TRACK_KEY
+// -guarded retry loops in pushBackupFirebase / pushAllToPublicCatalog.
+async function backupImportedPdfNow(storyId, pdfBytes, alsoPushPublic, setCloudSyncStatus) {
+  if (!cloudReady()) return; // nothing configured to back up to at all
+  if (setCloudSyncStatus) setCloudSyncStatus({ state: "syncing", message: "מגבים את קובץ ה-PDF לענן…" });
+  const jobs = [pushPdfFileToPersonalBackupNow(storyId, pdfBytes)];
+  if (alsoPushPublic) jobs.push(pushPdfFileToPublicCloud(storyId, pdfBytes));
+  const results = await Promise.allSettled(jobs);
+  results.forEach((r, i) => {
+    if (r.status === "rejected") console.error(`backupImportedPdfNow: destination #${i} rejected unexpectedly:`, r.reason, { storyId });
+  });
+  const anyFailed = results.some((r) => r.status === "rejected" || r.value === false);
+  if (!setCloudSyncStatus) return;
+  if (anyFailed) {
+    setCloudSyncStatus({ state: "error", message: "גיבוי קובץ ה-PDF לענן נכשל — ננסה שוב בגיבוי הבא" });
+  } else {
+    setCloudSyncStatus({ state: "done", message: "קובץ ה-PDF גובה בהצלחה" });
+  }
+}
+
+// Best-effort cleanup of a PRIVATE import's cloud-backed-up file chunks,
+// called when the reader deletes that book locally (see deleteStory).
+// Deliberately never used for a PUBLIC book — a public PDF's cloud copy may
+// be the ONLY copy other readers who downloaded that book still depend on,
+// to read chapters they personally haven't opened yet; deleting it here
+// would break other people's libraries. This only ever removes THIS
+// reader's own private backup copy, which nobody else can reach anyway —
+// freeing up real quota inside the pooled 3GB budget instead of leaving
+// orphaned chunks behind forever.
+async function deletePdfFileChunksFromBackupCloud(config, docId, storyId) {
+  const basePath = `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/${PDF_CHUNKS_SUBCOLLECTION}`;
+  try {
+    const meta = await firestoreGet(config, `${basePath}/${storyId}_meta`);
+    const chunkCount = meta && meta.fields && meta.fields.chunkCount && Number(meta.fields.chunkCount.integerValue);
+    if (!chunkCount) return;
+    for (let i = 0; i < chunkCount; i++) {
+      await firestoreDelete(config, `${basePath}/${storyId}_${i}`);
+    }
+    await firestoreDelete(config, `${basePath}/${storyId}_meta`);
+  } catch (e) {
+    console.error("deletePdfFileChunksFromBackupCloud failed (cloud copy may remain until a manual cleanup):", (e && e.message) || e, { storyId });
   }
 }
 
@@ -9893,7 +10086,9 @@ function App() {
     // book, and even for a private import) — a later full backup run reads
     // it from here to push to the cloud (see pushBackupFirebase), which can
     // happen in a completely different browser session than this import.
-    savePdfFileBytes(storyId, pdfBytes).catch(() => {});
+    // (savePdfFileBytes already logs its own failures internally and never
+    // rejects, so there's nothing to attach a .catch to here.)
+    savePdfFileBytes(storyId, pdfBytes);
 
     const outline = existingPublicStory ? existingPublicStory.outline : rawChapters.map((c) => ({ title: c.title, summary: "" }));
     const chapters = Array.from({ length: rawChapters.length }, () => null);
@@ -9942,26 +10137,36 @@ function App() {
 
     if (existingPublicStory) {
       // Someone else already published this exact book — there's nothing
-      // new to upload. This device just piggybacks on the existing cloud
-      // copy, exactly like downloading someone else's import normally
-      // works (see writeChapterAt's cloud-fallback branch above).
+      // new to upload to the PUBLIC catalog. This device just piggybacks on
+      // the existing cloud copy, exactly like downloading someone else's
+      // import normally works (see writeChapterAt's cloud-fallback branch
+      // above). It still needs its OWN private backup of the file though —
+      // see backupImportedPdfNow just below.
       setPublicPushTrack(storyId, generatedChapterCount(shellStory));
     } else {
       maybePushStoryToPublicLibrary(shellStory);
-      // Fire-and-forget: pushes the original PDF FILE itself to the public
-      // catalog (not just the first chapter embedded in shellStory above),
-      // so a reader on another device can extract ANY chapter of this book
-      // once it's downloaded, not just whichever ones this device happens
-      // to open first — see pushPdfFileToPublicCloud's comment for why this
-      // is needed. Never awaited: the reader is already reading chapter 1,
-      // and this shouldn't hold that up or surface errors either way.
-      if (shellStory.isPublic) {
-        pushPdfFileToPublicCloud(storyId, pdfBytes);
-        // Also register the fingerprint so the next reader who uploads this
-        // exact file finds this copy instead of creating another duplicate.
-        if (fingerprint) registerPdfFingerprint(publicConfig, fingerprint, storyId);
-      }
+      // Register the fingerprint immediately so the next reader who uploads
+      // this exact file finds this copy instead of creating a duplicate —
+      // safe to do right away regardless of whether the file upload below
+      // ends up succeeding on the first try.
+      if (shellStory.isPublic && fingerprint) registerPdfFingerprint(publicConfig, fingerprint, storyId);
     }
+
+    // Immediately push the ORIGINAL PDF FILE, in the background, to every
+    // cloud destination it belongs in: this reader's own private backup
+    // always, and — only for a brand-new public upload — the shared public
+    // catalog too (skipped when reusing an existing public book above,
+    // since there's nothing new to send there). This runs right now rather
+    // than waiting for the general debounced auto-backup (which might also
+    // be switched off), so a chapter someone else opens on a public book
+    // — or this reader restoring their own private import on a different
+    // device — doesn't depend on this session's auto-backup timing. Never
+    // awaited here (the reader is already reading chapter 1), but never
+    // silent about failure either — see backupImportedPdfNow for the
+    // visible status line + real console logging, and the retry loops in
+    // pushBackupFirebase / pushAllToPublicCatalog that pick up anything
+    // this immediate attempt doesn't manage to finish.
+    backupImportedPdfNow(storyId, pdfBytes, !existingPublicStory && shellStory.isPublic, setCloudSyncStatus);
   }
 
   // Imports a single article/page from a pasted link: fetches the page,
@@ -10132,14 +10337,26 @@ function App() {
           let pdfBytes = story.isPublic ? await fetchPdfFileFromPublicCloud(storyId) : null;
           if (!pdfBytes) pdfBytes = await fetchPdfFileFromPersonalBackup(storyId);
           if (pdfBytes) {
-            savePdfFileBytes(storyId, pdfBytes).catch(() => {});
+            // Caches the freshly-downloaded file locally so this device
+            // doesn't need to re-download it for the NEXT chapter too —
+            // savePdfFileBytes already logs its own failures internally and
+            // never rejects, so there's nothing to attach a .catch to here.
+            savePdfFileBytes(storyId, pdfBytes);
             setLoadingNote(jobId, "מחלצים את הפרקים מהקובץ…");
             const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
             const extracted = await extractPdfText(pdfBlob, (page, total) => {
               setLoadingNote(jobId, `מחלצים את הפרקים מהקובץ… (עמוד ${page.toLocaleString("he")} מתוך ${total.toLocaleString("he")})`);
             });
             rawChapters = splitPdfIntoChapters(extracted.pages, story.storyTitle);
-            savePdfRawChapters(storyId, rawChapters).catch(() => {});
+            // Unlike savePdfFileBytes, savePdfRawChapters has no internal
+            // error handling of its own — a failure here must not vanish
+            // silently: this chapter still displays fine THIS session (rc
+            // below reads straight from the in-memory rawChapters array),
+            // it just means the extraction would have to be redone next
+            // time if this device closes without a successful cache write.
+            savePdfRawChapters(storyId, rawChapters).catch((e) =>
+              console.error("savePdfRawChapters failed after restoring from cloud:", (e && e.message) || e, { storyId })
+            );
             rc = rawChapters[targetIndex];
           }
         }
@@ -10436,10 +10653,14 @@ function App() {
   }
 
   // Permanently removes a story (and everything tied to it): the story
-  // record itself, any saved words that point back to it, and — for an
-  // imported PDF book — its raw chapter text sitting in IndexedDB. If the
-  // story being deleted is the one currently open, backs out to the library
-  // instead of leaving the reader stranded on a story that no longer exists.
+  // record itself, any saved words that point back to it, its raw chapter
+  // text and original PDF file sitting in this device's own IndexedDB, and
+  // — for a PRIVATE import only — this reader's own cloud-backed-up copy of
+  // that file too (see deletePdfFileChunksFromBackupCloud's comment for why
+  // a PUBLIC book's cloud copy is deliberately left alone: other readers
+  // may still depend on it). If the story being deleted is the one
+  // currently open, backs out to the library instead of leaving the reader
+  // stranded on a story that no longer exists.
   async function deleteStory(storyId) {
     const story = state.stories[storyId];
     setState((prev) => {
@@ -10457,7 +10678,30 @@ function App() {
         db.transaction(PDF_DB_STORE, "readwrite").objectStore(PDF_DB_STORE).delete(storyId);
         db.transaction(PDF_FILE_STORE, "readwrite").objectStore(PDF_FILE_STORE).delete(storyId);
       } catch (e) {
-        // best-effort cleanup — the story record itself is already gone
+        // Best-effort local cleanup — the story record itself is already
+        // gone from state either way, so this can't leave the library in a
+        // broken spot. Still logged rather than swallowed: a stray
+        // never-cleaned-up IndexedDB entry is exactly the kind of thing
+        // that's invisible until storage quietly fills up.
+        console.error("deleteStory: local IndexedDB cleanup failed:", (e && e.message) || e, { storyId });
+      }
+      // Also drop THIS reader's own private cloud backup of the file, if
+      // any — fire-and-forget, never blocks the delete, and only ever runs
+      // for a book that was never public (see the function's own comment).
+      if (story.isPublic === false && cloudReady()) {
+        (async () => {
+          try {
+            const registryIdentity = await ensureGoogleSignedIn(undefined, false);
+            if (!registryIdentity) return;
+            const targetConfig = await resolveBackupProject(registryIdentity, undefined, false);
+            if (!targetConfig) return;
+            const targetIdentity = await identityForProject(registryIdentity, targetConfig, undefined, false);
+            if (!targetIdentity) return;
+            await deletePdfFileChunksFromBackupCloud(targetConfig, targetIdentity.uid, storyId);
+          } catch (e) {
+            console.error("deleteStory: cloud cleanup failed:", (e && e.message) || e, { storyId });
+          }
+        })();
       }
     }
     if (activeStoryId === storyId) {
