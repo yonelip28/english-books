@@ -44,6 +44,12 @@
        feature) — this never sends the file anywhere, extraction happens
        fully in the browser. -->
   <script src="https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+  <!-- Lossless gzip compression, used only to shrink the original PDF file
+       before it's chunked and pushed to Firestore (see pushPdfFileChunks) —
+       PDFs with uncompressed streams shrink noticeably; already-compressed
+       PDFs just pass through close to their original size, no data lost
+       either way. -->
+  <script src="https://unpkg.com/pako@2.1.0/dist/pako.min.js"></script>
   <!-- Firebase Authentication (Google sign-in) — only used in Firebase
        backup mode, so a reader who has entered their own project's details
        can sign in with Google instead of typing an email, and so Firestore
@@ -1801,9 +1807,9 @@ async function pushBackupFirebase(config, identity, state, onProgress) {
     bytesWritten += utf8ByteLength(payload);
   }
 
-  // Also push every imported PDF book's exact raw chapter text into this
-  // same private backup — not just whichever chapters this reader has
-  // already opened (all that travels with the story JSON above, see
+  // Also push every imported PDF book's ORIGINAL FILE into this same
+  // private backup — not just whichever chapters this reader has already
+  // opened (all that travels with the story JSON above, see
   // writeChapterAt). Without this, a PRIVATE import (isPublic: false, so it
   // never reaches the public catalog either) could only ever be reopened
   // one chapter at a time on the exact device that imported it — every
@@ -1815,13 +1821,16 @@ async function pushBackupFirebase(config, identity, state, onProgress) {
   // one that already succeeded is never re-sent for nothing.
   const pdfBackupTrack = getPdfChaptersPushTrack(PDF_CHAPTERS_BACKUP_TRACK_KEY);
   const importedIds = localStoryIds.filter((id) => state.stories[id] && state.stories[id].isImported && !pdfBackupTrack[id]);
-  if (importedIds.length && onProgress) onProgress(`מגבים תוכן פרקים מקוריים…`);
+  if (importedIds.length && onProgress) onProgress(`מגבים את קובצי ה-PDF המקוריים…`);
   for (let i = 0; i < importedIds.length; i++) {
     const id = importedIds[i];
-    const rawChapters = await loadPdfRawChapters(id);
-    if (rawChapters && rawChapters.length) {
-      await pushPdfRawChaptersToBackupCloud(config, docId, id, rawChapters);
-      setPdfChaptersPushed(PDF_CHAPTERS_BACKUP_TRACK_KEY, id);
+    const pdfBytes = await loadPdfFileBytes(id);
+    if (pdfBytes && pdfBytes.length) {
+      // Only flag as done when the push actually succeeded — otherwise a
+      // book whose upload failed (offline, auth not ready yet, ...) would
+      // get marked "done" anyway and never be retried on a future backup.
+      const ok = await pushPdfFileToBackupCloud(config, docId, id, pdfBytes);
+      if (ok) setPdfChaptersPushed(PDF_CHAPTERS_BACKUP_TRACK_KEY, id);
     }
   }
 
@@ -2430,15 +2439,15 @@ const PUBLIC_LIBRARY_INDEX_COLLECTION = "public_library_index";
 // + embedded images) of a book that's already there.
 const PUBLIC_PDF_FINGERPRINT_COLLECTION = "public_pdf_fingerprints";
 const PUBLIC_PUSH_TRACK_KEY = "reader-public-push-track";
-// Tracks, per storyId, whether an imported PDF's full raw chapter set has
-// already been confirmed pushed somewhere durable — separately for the
-// public catalog and for this reader's own private backup, since a book
-// can be in one, the other, both, or (briefly, right after import) neither.
-// Extracted chapter text never changes after import, so once a flag is set
-// it's set for good — this is purely a "don't re-send it every backup"
-// cache, not a correctness signal. See pushPdfRawChaptersToPublicCloud /
-// pushPdfRawChaptersToBackupCloud, and the retry loops in
-// pushAllToPublicCatalog / pushBackupFirebase that consult it.
+// Tracks, per storyId, whether an imported PDF's original FILE has already
+// been confirmed pushed somewhere durable — separately for the public
+// catalog and for this reader's own private backup, since a book can be in
+// one, the other, both, or (briefly, right after import) neither. The file
+// never changes after import, so once a flag is set it's set for good —
+// this is purely a "don't re-send it every backup" cache, not a
+// correctness signal. See pushPdfFileToPublicCloud / pushPdfFileToBackupCloud,
+// and the retry loops in pushAllToPublicCatalog / pushBackupFirebase that
+// consult it.
 const PDF_CHAPTERS_PUBLIC_TRACK_KEY = "reader-pdf-chapters-public-track";
 const PDF_CHAPTERS_BACKUP_TRACK_KEY = "reader-pdf-chapters-backup-track";
 function getPdfChaptersPushTrack(key) {
@@ -2511,6 +2520,12 @@ function publicLibraryPreview(story) {
     totalChapters: story.totalChapters,
     generatedChapters: generatedChapterCount(story),
     updatedAt: Date.now(),
+    // Creation date of the story itself — set once, the first time the
+    // story is pushed, and never touched again on later pushes (those only
+    // refresh updatedAt above). Older catalog entries pushed before this
+    // field existed won't have it; the library UI falls back gracefully
+    // when it's missing rather than showing a bad date.
+    createdAt: story.createdAt || null,
   };
 }
 
@@ -2566,94 +2581,163 @@ async function pushStoryToPublicLibrary(story) {
   }
 }
 
-// PDF-imported books keep their exact raw chapter text in this device's
-// own IndexedDB only (see PDF_DB_STORE above) — normally enough, since the
+// PDF-imported books keep their exact original file on this device's own
+// IndexedDB only (see PDF_FILE_STORE above) — normally enough, since the
 // reader who imported it already has it locally. But once the book is
 // shared to the public catalog, a DIFFERENT reader's device has no such
 // local copy: only whichever chapters the importer had already opened (and
 // so got baked into story.chapters, see writeChapterAt/maybePushStoryTo-
 // PublicLibrary) travel along with the story's own JSON. Any chapter the
 // importer never got to would otherwise be permanently unreachable on
-// every other device. To fix that, every raw chapter extracted at import
-// time is ALSO pushed here, each as its own small document (never one
-// giant blob, so even a long book stays well under Firestore's ~1MB
-// per-document limit) — so any device that downloads a public PDF import
-// can pull any not-yet-opened chapter straight from the cloud, exactly
-// like the pattern already used for per-story/per-word backup documents.
-async function pushPdfRawChaptersToPublicCloud(storyId, rawChapters) {
+// every other device.
+//
+// The fix: push the ORIGINAL PDF FILE itself to the cloud (gzip-compressed,
+// see the pako <script> tag in <head>, then split into fixed-size chunks —
+// never one giant document, so even a huge book stays well under
+// Firestore's ~1MB per-document limit no matter how many chapters or
+// pictures it has). Any device that needs a chapter it doesn't have locally
+// downloads the file ONCE and runs the exact same local extraction
+// (extractPdfText/splitPdfIntoChapters) this device used at import time —
+// producing identical chapters/images, no separate cloud format to keep in
+// sync with the extraction logic.
+//
+// Firestore's hard cap is ~1,048,487 bytes per document — chunks are sized
+// well under that (comfortably under even after base64, which adds ~33%).
+const PDF_FILE_CHUNK_RAW_BYTES = 650000;
+
+function uint8ToBase64(bytes) {
+  let binary = "";
+  const step = 0x8000; // avoid a giant call stack from String.fromCharCode(...bytes)
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+  }
+  return btoa(binary);
+}
+function base64ToUint8(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+// Pushes one file's bytes (already gzip-compressed by the caller) to
+// `${basePath}/0`, `${basePath}/1`, ... plus a `${basePath}/meta` document
+// recording the chunk count, so a downloader knows how many pieces to ask
+// for. Skips entirely — no reads, no writes — if `meta` is already there:
+// this exact file was already uploaded (by this reader or another one), so
+// there is nothing new to send. This is the "no duplicate file upload"
+// behavior: only a file that doesn't already exist in the cloud gets
+// pushed at all.
+async function pushFileChunksIfMissing(config, basePath, compressedBytes) {
+  const existingMeta = await firestoreGet(config, `${basePath}/meta`);
+  if (existingMeta) return; // already uploaded — nothing to do
+  const chunkCount = Math.max(1, Math.ceil(compressedBytes.length / PDF_FILE_CHUNK_RAW_BYTES));
+  for (let i = 0; i < chunkCount; i++) {
+    const slice = compressedBytes.subarray(i * PDF_FILE_CHUNK_RAW_BYTES, (i + 1) * PDF_FILE_CHUNK_RAW_BYTES);
+    await firestoreSet(config, `${basePath}/${i}`, { data: strField(uint8ToBase64(slice)) });
+  }
+  await firestoreSet(config, `${basePath}/meta`, { chunkCount: intField(chunkCount) });
+}
+
+// Downloads and reassembles a file previously pushed by pushFileChunksIfMissing,
+// returning its original (decompressed) bytes, or null if it isn't there /
+// is incomplete.
+async function fetchFileChunks(config, basePath) {
+  const meta = await firestoreGet(config, `${basePath}/meta`);
+  const chunkCount = meta && meta.fields && meta.fields.chunkCount && Number(meta.fields.chunkCount.integerValue);
+  if (!chunkCount) return null;
+  const parts = [];
+  let totalLen = 0;
+  for (let i = 0; i < chunkCount; i++) {
+    const doc = await firestoreGet(config, `${basePath}/${i}`);
+    const b64 = doc && doc.fields && doc.fields.data && doc.fields.data.stringValue;
+    if (!b64) return null; // incomplete upload — treat as unavailable rather than return a corrupt file
+    const bytes = base64ToUint8(b64);
+    parts.push(bytes);
+    totalLen += bytes.length;
+  }
+  const compressed = new Uint8Array(totalLen);
+  let offset = 0;
+  parts.forEach((p) => { compressed.set(p, offset); offset += p.length; });
+  return pako.ungzip(compressed);
+}
+
+// Returns true if the file is already in the cloud (or was just uploaded
+// successfully); false only on an actual failure — callers use this to
+// decide whether it's safe to mark the book as "done" (see
+// PDF_FILE_PUBLIC_TRACK_KEY below): treating a failed push as done would
+// mean it never gets retried, ever.
+async function pushPdfFileToPublicCloud(storyId, pdfBytes) {
   const config = publicLibraryConfig();
-  if (!config) return;
+  if (!config) return false;
   try {
     getGoogleUser(config) || (await signInSilentlyWithCredential(config)); // best-effort, same as pushStoryToPublicLibrary — no popup
-    for (let i = 0; i < rawChapters.length; i++) {
-      const payload = JSON.stringify(rawChapters[i]);
-      await firestoreSet(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/pdfChapters/${i}`, {
-        data: strField(payload),
-      });
-    }
+    const compressed = pako.gzip(pdfBytes);
+    await pushFileChunksIfMissing(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/pdfFile`, compressed);
+    return true;
   } catch (e) {
     // Best-effort, exactly like pushStoryToPublicLibrary above — the
     // reader's own copy already saved successfully on this device
-    // regardless of whether this cloud copy succeeds.
-    console.error("pushPdfRawChaptersToPublicCloud failed:", (e && e.message) || e);
+    // regardless of whether this cloud copy succeeds. But unlike that
+    // function, our callers DO need to know about the failure (to avoid
+    // marking this book as pushed when it wasn't) — hence returning false
+    // instead of just swallowing it.
+    console.error("pushPdfFileToPublicCloud failed:", (e && e.message) || e);
+    return false;
   }
 }
 
-// Fetches one raw PDF chapter from the public catalog — the fallback used
+// Fetches the original PDF file from the public catalog — the fallback used
 // when a chapter isn't in this device's own local IndexedDB (see
-// writeChapterAt's isImported branch below), which is always the case
-// right after downloading someone else's imported book from the public
-// library and opening a chapter its importer never got to.
-async function fetchPdfRawChapterFromPublicCloud(storyId, index) {
+// writeChapterAt's isImported branch below), which is always the case right
+// after downloading someone else's imported book from the public library
+// and opening a chapter its importer never got to.
+async function fetchPdfFileFromPublicCloud(storyId) {
   const config = publicLibraryConfig();
   if (!config) return null;
   try {
-    const doc = await firestoreGet(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/pdfChapters/${index}`);
-    const raw = doc && doc.fields && doc.fields.data && doc.fields.data.stringValue;
-    return raw ? JSON.parse(raw) : null;
+    return await fetchFileChunks(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}/pdfFile`);
   } catch (e) {
     return null;
   }
 }
 
-// Same idea as pushPdfRawChaptersToPublicCloud/fetchPdfRawChapterFromPublicCloud
-// above, but for a PRIVATE imported PDF (isPublic === false, so it's never
-// written to the public catalog at all) — the raw chapters instead ride
-// along with this reader's own personal backup, under the same
+// Same idea as pushPdfFileToPublicCloud/fetchPdfFileFromPublicCloud above,
+// but for a PRIVATE imported PDF (isPublic === false, so it's never written
+// to the public catalog at all) — the file instead rides along with this
+// reader's own personal backup, under the same
 // reader_backups/{uid}/stories/{storyId} document the story JSON itself
 // already lives in. Covered by the existing `reader_backups/{uid}/{document=**}`
 // security rule (see BackupSettingsPanel's rules snippet), since that rule
 // is recursive over everything nested under the reader's own uid.
-async function pushPdfRawChaptersToBackupCloud(config, docId, storyId, rawChapters) {
+async function pushPdfFileToBackupCloud(config, docId, storyId, pdfBytes) {
   try {
-    for (let i = 0; i < rawChapters.length; i++) {
-      const payload = JSON.stringify(rawChapters[i]);
-      await firestoreSet(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/pdfChapters/${i}`, {
-        data: strField(payload),
-      });
-    }
+    const compressed = pako.gzip(pdfBytes);
+    await pushFileChunksIfMissing(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/pdfFile`, compressed);
+    return true;
   } catch (e) {
     // Best-effort, same as the public-catalog version — the reader's own
-    // local copy (IndexedDB) already has everything regardless.
-    console.error("pushPdfRawChaptersToBackupCloud failed:", (e && e.message) || e);
+    // local copy (IndexedDB) already has everything regardless. But the
+    // caller still needs to know this failed, so it doesn't mark the book
+    // as backed-up when it isn't — hence returning false here.
+    console.error("pushPdfFileToBackupCloud failed:", (e && e.message) || e);
+    return false;
   }
 }
-async function fetchPdfRawChapterFromBackupCloud(config, docId, storyId, index) {
+async function fetchPdfFileFromBackupCloud(config, docId, storyId) {
   try {
-    const doc = await firestoreGet(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/pdfChapters/${index}`);
-    const raw = doc && doc.fields && doc.fields.data && doc.fields.data.stringValue;
-    return raw ? JSON.parse(raw) : null;
+    return await fetchFileChunks(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(storyId)}/pdfFile`);
   } catch (e) {
     return null;
   }
 }
 // Resolves this reader's own backup identity (Firebase mode only — Netlify
-// mode has no per-chapter fetch capability, see pushBackupNetlify's single-
-// blob storage) non-interactively — never pops up a Google sign-in window,
-// so this is safe to call just from opening a chapter. Used as the last
+// mode has no per-file fetch capability, see pushBackupNetlify's single-blob
+// storage) non-interactively — never pops up a Google sign-in window, so
+// this is safe to call just from opening a chapter. Used as the last
 // fallback in writeChapterAt's isImported branch, for a private PDF import
 // restored to a device that never extracted it locally.
-async function fetchPdfRawChapterFromPersonalBackup(storyId, index) {
+async function fetchPdfFileFromPersonalBackup(storyId) {
   try {
     const config = getCloudConfig();
     if (!config) return null;
@@ -2663,7 +2747,7 @@ async function fetchPdfRawChapterFromPersonalBackup(storyId, index) {
     if (!targetConfig) return null;
     const targetIdentity = await identityForProject(registryIdentity, targetConfig, undefined, false);
     if (!targetIdentity) return null;
-    return await fetchPdfRawChapterFromBackupCloud(targetConfig, targetIdentity.uid, storyId, index);
+    return await fetchPdfFileFromBackupCloud(targetConfig, targetIdentity.uid, storyId);
   } catch (e) {
     return null;
   }
@@ -2707,7 +2791,7 @@ async function findExistingPublicPdfBook(config, fingerprint, expectedChapterCou
 // Registers this book's fingerprint -> storyId so the NEXT reader who
 // imports the identical file reuses this copy instead of duplicating it.
 // Best-effort and non-blocking, same reasoning as
-// pushPdfRawChaptersToPublicCloud above.
+// pushPdfFileToPublicCloud above.
 async function registerPdfFingerprint(config, fingerprint, storyId) {
   try {
     await firestoreSet(config, `${PUBLIC_PDF_FINGERPRINT_COLLECTION}/${fingerprint}`, {
@@ -2952,24 +3036,30 @@ async function pushAllToPublicCatalog(state, onProgress) {
     storiesPushed++;
   }
 
-  // Also retry pushing each PUBLIC imported PDF's full raw chapter set —
-  // the story shell pushed just above only ever carries whichever chapters
-  // this reader has personally opened (see writeChapterAt); every other
-  // chapter depends entirely on pushPdfRawChaptersToPublicCloud, which
-  // normally only runs once, fire-and-forget, right at import time (see the
-  // PDF-import flow). If that one-time push didn't fully finish — offline,
-  // closed the tab early, a big book with many chapters — those chapters
-  // would otherwise be permanently unreachable from any other device. This
-  // retries it on every backup instead, skipping any book already flagged
-  // as done (PDF_CHAPTERS_PUBLIC_TRACK_KEY) so it costs nothing once caught up.
+  // Also retry pushing each PUBLIC imported PDF's ORIGINAL FILE — the story
+  // shell pushed just above only ever carries whichever chapters this
+  // reader has personally opened (see writeChapterAt); every other chapter
+  // depends entirely on pushPdfFileToPublicCloud, which normally only runs
+  // once, fire-and-forget, right at import time (see the PDF-import flow).
+  // If that one-time push didn't fully finish — offline, closed the tab
+  // early, a big file — the book would otherwise be permanently
+  // unreachable (beyond chapter 1) from any other device. This retries it
+  // on every backup instead, skipping any book already flagged as done
+  // (PDF_CHAPTERS_PUBLIC_TRACK_KEY) so it costs nothing once caught up —
+  // and pushPdfFileToPublicCloud itself skips the actual upload if this
+  // exact file is already sitting in the cloud (see pushFileChunksIfMissing),
+  // so no file is ever uploaded twice.
   const pdfPublicTrack = getPdfChaptersPushTrack(PDF_CHAPTERS_PUBLIC_TRACK_KEY);
   const importedPublicStories = stories.filter((s) => s.isImported && !pdfPublicTrack[s.id]);
   for (let i = 0; i < importedPublicStories.length; i++) {
     const s = importedPublicStories[i];
-    const rawChapters = await loadPdfRawChapters(s.id);
-    if (rawChapters && rawChapters.length) {
-      await pushPdfRawChaptersToPublicCloud(s.id, rawChapters);
-      setPdfChaptersPushed(PDF_CHAPTERS_PUBLIC_TRACK_KEY, s.id);
+    const pdfBytes = await loadPdfFileBytes(s.id);
+    if (pdfBytes && pdfBytes.length) {
+      // Same fix as the private-backup loop above: only flag as done on an
+      // actual success, so a failed attempt gets retried on the next backup
+      // instead of being marked "done" forever.
+      const ok = await pushPdfFileToPublicCloud(s.id, pdfBytes);
+      if (ok) setPdfChaptersPushed(PDF_CHAPTERS_PUBLIC_TRACK_KEY, s.id);
     }
   }
 
@@ -4021,6 +4111,11 @@ if (window.pdfjsLib) {
 // from ever crowding out (or being crowded out by) everything else saved.
 const PDF_DB_NAME = "pdf-import-db";
 const PDF_DB_STORE = "chapters";
+// Holds the ORIGINAL PDF file's raw bytes (as a Blob) per storyId — kept
+// alongside the extracted chapters so a later full backup (which can run in
+// a completely different browser session than the import itself) still has
+// the actual file to push to the cloud. See pushPdfFileChunks.
+const PDF_FILE_STORE = "files";
 let pdfDbPromise = null;
 function openPdfDb() {
   if (pdfDbPromise) return pdfDbPromise;
@@ -4029,10 +4124,13 @@ function openPdfDb() {
       reject(new Error("הדפדפן הזה לא תומך באחסון קבצים גדולים (IndexedDB)."));
       return;
     }
-    const req = indexedDB.open(PDF_DB_NAME, 1);
+    const req = indexedDB.open(PDF_DB_NAME, 2);
     req.onupgradeneeded = () => {
       if (!req.result.objectStoreNames.contains(PDF_DB_STORE)) {
         req.result.createObjectStore(PDF_DB_STORE);
+      }
+      if (!req.result.objectStoreNames.contains(PDF_FILE_STORE)) {
+        req.result.createObjectStore(PDF_FILE_STORE);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -4058,6 +4156,34 @@ async function loadPdfRawChapters(storyId) {
     req.onerror = () => reject(req.error || new Error("טעינת פרקי הספר נכשלה."));
   });
 }
+// Saves the exact original PDF file's bytes so it can be pushed to the
+// cloud later (at backup time, possibly in a later session) — see
+// PDF_FILE_STORE above. Best-effort: a failure here never blocks the
+// import itself, it just means this device won't have the file handy to
+// share later (the extracted chapters this device needs are unaffected).
+async function savePdfFileBytes(storyId, bytes) {
+  try {
+    const db = await openPdfDb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(PDF_FILE_STORE, "readwrite");
+      tx.objectStore(PDF_FILE_STORE).put(bytes, storyId);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error("שמירת קובץ ה-PDF נכשלה."));
+    });
+  } catch (e) {
+    console.error("savePdfFileBytes failed:", (e && e.message) || e);
+  }
+}
+async function loadPdfFileBytes(storyId) {
+  const db = await openPdfDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PDF_FILE_STORE, "readonly");
+    const req = tx.objectStore(PDF_FILE_STORE).get(storyId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error("טעינת קובץ ה-PDF נכשלה."));
+  });
+}
+
 
 // Extracts a PDF page by page as an array of LINES (not one flat string),
 // keeping each line's font size and its vertical position on the page.
@@ -4972,7 +5098,23 @@ function extractArticleMeta(doc, pageUrl) {
     (byline ? byline.textContent.replace(/\s+/g, " ").trim() : "");
   const siteName = metaContent('meta[property="og:site_name"]') || domain;
   const leadImage = metaContent('meta[property="og:image"]') || metaContent('meta[name="twitter:image"]');
-  return { title, author, siteName, domain, leadImage };
+  // The standfirst/deck/dek: the one-sentence summary that sits between
+  // headline and body on most news/magazine sites. Checked as an actual
+  // page element first (common CMS class/attribute names), since that's
+  // also the element we need to strip out of the body text below so it
+  // isn't extracted twice — once here, once again as a plain paragraph.
+  // Falls back to the page's own meta description when no such element
+  // exists; there's nothing to strip out for that case since it was never
+  // part of the visible body to begin with.
+  const standfirstEl = doc.querySelector(
+    '[data-gu-name="standfirst"], [data-testid="standfirst"], .standfirst, [class*="standfirst" i], [class*="Standfirst" i], .article-subtitle, .entry-subtitle, .post-subtitle, .article-dek, .dek, .deck, [class*="dek" i][class*="header" i], [class*="subheadline" i], [class*="sub-headline" i], [itemprop="description"]'
+  );
+  const standfirst =
+    (standfirstEl && standfirstEl.textContent.replace(/\s+/g, " ").trim()) ||
+    metaContent('meta[property="og:description"]') ||
+    metaContent('meta[name="description"]') ||
+    "";
+  return { title, author, siteName, domain, leadImage, standfirst, h1El: h1 || null, standfirstEl: standfirstEl || null };
 }
 
 // Ties the pieces above together: parse → strip junk → find the article →
@@ -4983,6 +5125,13 @@ async function extractArticleFromHtml(html, pageUrl) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   doc.querySelectorAll(ARTICLE_JUNK_SELECTOR).forEach((el) => el.remove());
   const meta = extractArticleMeta(doc, pageUrl);
+  // The headline and standfirst are surfaced separately (meta.title /
+  // meta.standfirst, rendered as their own styled elements above the
+  // chapter text) — remove them from the DOM now so extractArticleBody's
+  // walk below can't also sweep them up as ordinary paragraphs, which
+  // would duplicate the headline inside the body text.
+  if (meta.h1El) meta.h1El.remove();
+  if (meta.standfirstEl) meta.standfirstEl.remove();
   const container = pickArticleContainer(doc);
   const { content, images } = extractArticleBody(container, pageUrl);
   if (!content || countWords(content) < 40) {
@@ -4996,7 +5145,15 @@ async function extractArticleFromHtml(html, pageUrl) {
       if (!images.some((im) => im.url === abs)) images.unshift({ offset: 0, url: abs });
     } catch (e) {}
   }
-  return { title: meta.title, author: meta.author, siteName: meta.siteName, domain: meta.domain, content, images: images.slice(0, 8) };
+  return {
+    title: meta.title,
+    author: meta.author,
+    siteName: meta.siteName,
+    domain: meta.domain,
+    standfirst: meta.standfirst,
+    content,
+    images: images.slice(0, 8),
+  };
 }
 
 // Turns each extracted image's URL into an embedded data URL (so the
@@ -9698,6 +9855,12 @@ function App() {
   // chapter is filled in later, on demand, the moment it's actually opened.
   async function importPdfStory(file, onProgress, isPublic = true) {
     if (onProgress) onProgress("קוראים את קובץ ה-PDF…");
+    // Keep the exact original bytes — this is what actually gets pushed to
+    // the cloud (see below), not the extracted chapters, so any other
+    // device can regenerate identical chapters/images straight from the
+    // real file instead of relying on a separate cloud copy of our own
+    // extraction output.
+    const pdfBytes = new Uint8Array(await file.arrayBuffer());
     const { pages, meta, frontCoverImage, backCoverImage } = await extractPdfText(file, (page, total) => {
       if (onProgress) onProgress(`קוראים את קובץ ה-PDF… (עמוד ${page.toLocaleString("he")} מתוך ${total.toLocaleString("he")})`);
     });
@@ -9726,6 +9889,11 @@ function App() {
     // means this reader can open any chapter offline right away regardless
     // of whether the content came from the cloud or was just extracted.
     await savePdfRawChapters(storyId, rawChapters);
+    // Also keep the original file itself locally (even for a reused public
+    // book, and even for a private import) — a later full backup run reads
+    // it from here to push to the cloud (see pushBackupFirebase), which can
+    // happen in a completely different browser session than this import.
+    savePdfFileBytes(storyId, pdfBytes).catch(() => {});
 
     const outline = existingPublicStory ? existingPublicStory.outline : rawChapters.map((c) => ({ title: c.title, summary: "" }));
     const chapters = Array.from({ length: rawChapters.length }, () => null);
@@ -9780,15 +9948,15 @@ function App() {
       setPublicPushTrack(storyId, generatedChapterCount(shellStory));
     } else {
       maybePushStoryToPublicLibrary(shellStory);
-      // Fire-and-forget: pushes every extracted chapter's raw text to the
-      // public catalog (not just the first one embedded in shellStory above),
-      // so a reader on another device can open ANY chapter of this book once
-      // it's downloaded, not just whichever ones this device happens to open
-      // first — see pushPdfRawChaptersToPublicCloud's comment for why this is
-      // needed. Never awaited: the reader is already reading chapter 1, and
-      // this shouldn't hold that up or surface errors either way.
+      // Fire-and-forget: pushes the original PDF FILE itself to the public
+      // catalog (not just the first chapter embedded in shellStory above),
+      // so a reader on another device can extract ANY chapter of this book
+      // once it's downloaded, not just whichever ones this device happens
+      // to open first — see pushPdfFileToPublicCloud's comment for why this
+      // is needed. Never awaited: the reader is already reading chapter 1,
+      // and this shouldn't hold that up or surface errors either way.
       if (shellStory.isPublic) {
-        pushPdfRawChaptersToPublicCloud(storyId, rawChapters);
+        pushPdfFileToPublicCloud(storyId, pdfBytes);
         // Also register the fingerprint so the next reader who uploads this
         // exact file finds this copy instead of creating another duplicate.
         if (fingerprint) registerPdfFingerprint(publicConfig, fingerprint, storyId);
@@ -9877,6 +10045,7 @@ function App() {
       subtopic: "כתבה מיובאת מקישור",
       source: article.siteName,
       author: article.author || null,
+      standfirst: article.standfirst || "",
       isImported: true,
       isPublic: false, // hardcoded — see storyIsPublic()'s own hardcoded override too
       webSource: { url: parsedUrl.href, domain: article.domain, fetchedAt: Date.now() },
@@ -9950,36 +10119,28 @@ function App() {
         if (!rc) {
           // Not on this device's own IndexedDB — the normal case right
           // after downloading someone else's imported book from the public
-          // library, since only chapters its importer had already opened
-          // travel with the story itself. Fall back to the full copy
-          // pushed to the cloud at import time (see
-          // pushPdfRawChaptersToPublicCloud) instead of failing outright.
-          const cloudChapter = await fetchPdfRawChapterFromPublicCloud(storyId, targetIndex);
-          if (cloudChapter) {
-            rc = cloudChapter;
-            const merged = rawChapters.slice();
-            merged[targetIndex] = cloudChapter;
-            rawChapters = merged;
-            // Cache it locally too, so reopening this chapter later —
-            // even offline — never needs the network again.
+          // library, or restoring a private import to a new device: only
+          // chapters the importer had already opened travel with the story
+          // itself. Fall back to the ORIGINAL PDF FILE pushed to the cloud
+          // at import time (public copy first, then this reader's own
+          // private backup — see pushPdfFileToPublicCloud /
+          // pushPdfFileToBackupCloud) and re-run the exact same local
+          // extraction this device would have run had it imported the file
+          // itself — same chapters, same images, nothing cloud-format-
+          // specific to keep in sync.
+          setLoadingNote(jobId, "מורידים את קובץ ה-PDF המקורי…");
+          let pdfBytes = story.isPublic ? await fetchPdfFileFromPublicCloud(storyId) : null;
+          if (!pdfBytes) pdfBytes = await fetchPdfFileFromPersonalBackup(storyId);
+          if (pdfBytes) {
+            savePdfFileBytes(storyId, pdfBytes).catch(() => {});
+            setLoadingNote(jobId, "מחלצים את הפרקים מהקובץ…");
+            const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
+            const extracted = await extractPdfText(pdfBlob, (page, total) => {
+              setLoadingNote(jobId, `מחלצים את הפרקים מהקובץ… (עמוד ${page.toLocaleString("he")} מתוך ${total.toLocaleString("he")})`);
+            });
+            rawChapters = splitPdfIntoChapters(extracted.pages, story.storyTitle);
             savePdfRawChapters(storyId, rawChapters).catch(() => {});
-          }
-        }
-        if (!rc) {
-          // Still nothing — either this book was never shared publicly
-          // (isPublic: false), or the public copy is missing this chapter
-          // for some other reason. Last resort: this reader's own PRIVATE
-          // backup, which is where a private import's raw chapters live
-          // once pushBackupFirebase has had a chance to push them (see
-          // pushPdfRawChaptersToBackupCloud). This is the normal case right
-          // after restoring a personal PDF import to a brand-new device.
-          const backupChapter = await fetchPdfRawChapterFromPersonalBackup(storyId, targetIndex);
-          if (backupChapter) {
-            rc = backupChapter;
-            const merged = rawChapters.slice();
-            merged[targetIndex] = backupChapter;
-            rawChapters = merged;
-            savePdfRawChapters(storyId, rawChapters).catch(() => {});
+            rc = rawChapters[targetIndex];
           }
         }
         if (!rc) throw new Error("לא נמצא תוכן הפרק הזה בקובץ שהועלה. ודאו שגיבוי בוצע במכשיר שבו הספר יובא, ושהמכשיר הזה מחובר לאינטרנט ולאותו חשבון גיבוי.");
@@ -10260,7 +10421,17 @@ function App() {
   function addDownloadedPublicStory(story) {
     setState((prev) => {
       if (prev.stories[story.id]) return prev;
-      return { ...prev, stories: { ...prev.stories, [story.id]: { ...story, fromPublicLibrary: true } } };
+      return {
+        ...prev,
+        stories: {
+          ...prev.stories,
+          // downloadedAt: when THIS reader pulled the book into their own
+          // library — distinct from the story's original createdAt (when
+          // its author first made it). For a public-library book, the date
+          // shown in "הספרייה שלי" should be this one, not the author's.
+          [story.id]: { ...story, fromPublicLibrary: true, downloadedAt: Date.now() },
+        },
+      };
     });
   }
 
@@ -10284,6 +10455,7 @@ function App() {
       try {
         const db = await openPdfDb();
         db.transaction(PDF_DB_STORE, "readwrite").objectStore(PDF_DB_STORE).delete(storyId);
+        db.transaction(PDF_FILE_STORE, "readwrite").objectStore(PDF_FILE_STORE).delete(storyId);
       } catch (e) {
         // best-effort cleanup — the story record itself is already gone
       }
@@ -12192,6 +12364,9 @@ function PublicLibraryView({ state, onDownload, onOpenStory, onBack }) {
                     {cat.itemLabel ? `${cat.itemLabel}ים` : "פרקים"}
                     {preview.source ? ` · ${preview.source}` : ""}
                   </div>
+                  {createdDateLabel(preview.createdAt) && (
+                    <div style={{ fontSize: 11.5, color: "#8a9089", marginTop: 2 }}>{createdDateLabel(preview.createdAt)}</div>
+                  )}
                   <div style={{ display: "flex", marginTop: 8 }}>
                     {owned ? (
                       <SecondaryButton onClick={() => onOpenStory(preview.id)} style={{ padding: "7px 12px", fontSize: 12.5, whiteSpace: "nowrap" }}>
@@ -15295,9 +15470,9 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
           touchAction: "pan-y",
         }}
       >
-        {story.totalChapters > 1 && (!paginated || pageIndex === 0) && (
+        {(story.totalChapters > 1 || story.categoryId === "webImport") && (!paginated || pageIndex === 0) && (
           <div style={{ marginBottom: 14, direction: "ltr", textAlign: "left" }}>
-            {!/^chapter\s+\S+\s*[:.\-–]/i.test((chapter.title || "").trim()) && (
+            {story.totalChapters > 1 && !/^chapter\s+\S+\s*[:.\-–]/i.test((chapter.title || "").trim()) && (
               <div
                 style={{
                   fontFamily: "'IBM Plex Mono', monospace",
@@ -15322,6 +15497,32 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
                 speakingOffset={headingHighlightOffset}
               />
             </div>
+            {story.categoryId === "webImport" && story.standfirst && (
+              // The article's standfirst/deck — the one-line summary
+              // between headline and body on the original page. Styled
+              // distinctly (lighter weight, italic, muted color) so it
+              // reads as a subheading, not as the first line of body text.
+              <div
+                style={{
+                  fontFamily: "'Lora', serif",
+                  fontSize: 15.5,
+                  fontWeight: 600,
+                  fontStyle: "italic",
+                  color: "#5c665f",
+                  lineHeight: 1.55,
+                  marginTop: 8,
+                }}
+              >
+                <ClickableText
+                  as="span"
+                  content={story.standfirst}
+                  source="story-standfirst"
+                  savedWordsLower={savedWordsLower}
+                  onWordClick={onWordClick}
+                  phraseAnchor={phraseAnchor}
+                />
+              </div>
+            )}
           </div>
         )}
         {(imageAbove || paginated) && pageIndex === 0 && (
@@ -17016,6 +17217,30 @@ function timeAgoLabel(ts) {
   return `נקרא ב-${new Date(ts).toLocaleDateString("he")}`;
 }
 
+// Creation date only — never a "last modified"/"last read"/"last synced"
+// date. Used under every book/story listing (personal library and the
+// public catalog alike), no exceptions. Returns null (render nothing) when
+// there's no timestamp to show, rather than printing a bogus date.
+function createdDateLabel(ts) {
+  if (!ts) return null;
+  return `נוצר ב-${new Date(ts).toLocaleDateString("he", { year: "numeric", month: "long", day: "numeric" })}`;
+}
+
+// For a book that came from the public catalog (story.fromPublicLibrary),
+// "creation date" in the personal library means the date THIS reader added
+// it to their own library — not the original author's creation date — and
+// is flagged as such with "(מספרייה ציבורית)" so it's never mistaken for a
+// book the reader wrote themselves. Falls back to the story's own createdAt
+// only for books downloaded before this distinction existed (no
+// downloadedAt recorded yet).
+function libraryDateLabel(story) {
+  if (story.fromPublicLibrary) {
+    const label = createdDateLabel(story.downloadedAt || story.createdAt);
+    return label ? `${label} (מספרייה ציבורית)` : null;
+  }
+  return createdDateLabel(story.createdAt);
+}
+
 function SyncInfoModal({ story, onClose, onSyncNow, syncing, progressMsg, result }) {
   return (
     <div
@@ -17235,7 +17460,7 @@ function LibraryView({ state, setState, onOpen, onRequestDelete }) {
       </div>
       {sortMode === "topic" && (
         <div style={{ color: "#8a9089", fontSize: 11.5, marginBottom: 8, lineHeight: 1.5 }}>
-          אפשר לסמן "פרטי" או "ציבורי" ביחד עם קטגוריה נוספת, כדי לסנן לפי שניהם יחד. לחיצה חוזרת על "פרטי"/"ציבורי" מבטלת את הסימון ומציגה שוב את שני הסוגים.
+          אפשר לסמן "פרטי" או "ציבורי" ביחד עם קטגוריה נוספת, כדי לסנן לפי שניהם יחד. לחיצה חוזרת על "פרטי"/"ציבורי" מבטלת את הסימון ומציגה שוב את שני הסוגים. בחירת "הכל" מנקה גם את סימון הפרטי/ציבורי. "מאמר מקישור" הוא תמיד פרטי — לכן הוא נעול על "פרטי", ו"ציבורי" לא ניתן לסימון במקביל אליו.
         </div>
       )}
       {sortMode !== "lastRead" && sortMode !== "liked" && (
@@ -17278,81 +17503,116 @@ function LibraryView({ state, setState, onOpen, onRequestDelete }) {
             </>
           ) : (
             <>
-              <button
-                onClick={() => updateLibrarySort({ topicFilter: "all" })}
-                style={{
-                  border: `1.5px solid ${topicFilter === "all" ? "var(--ink)" : "var(--line-strong)"}`,
-                  background: topicFilter === "all" ? "var(--ink)" : "transparent",
-                  color: topicFilter === "all" ? "var(--paper)" : "var(--ink)",
-                  borderRadius: 999,
-                  padding: "5px 11px",
-                  fontSize: 11,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
-              >
-                הכל
-              </button>
-              <button
-                onClick={() => toggleVisFilter("public")}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 5,
-                  border: `1.5px solid ${visFilter === "public" ? "var(--ink)" : "var(--line-strong)"}`,
-                  background: visFilter === "public" ? "var(--ink)" : "transparent",
-                  color: visFilter === "public" ? "var(--paper)" : "var(--ink)",
-                  borderRadius: 999,
-                  padding: "5px 11px",
-                  fontSize: 11,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
-              >
-                <AppIcon name="Globe" size={11} />
-                ציבורי
-              </button>
-              <button
-                onClick={() => toggleVisFilter("private")}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 5,
-                  border: `1.5px solid ${visFilter === "private" ? "var(--ink)" : "var(--line-strong)"}`,
-                  background: visFilter === "private" ? "var(--ink)" : "transparent",
-                  color: visFilter === "private" ? "var(--paper)" : "var(--ink)",
-                  borderRadius: 999,
-                  padding: "5px 11px",
-                  fontSize: 11,
-                  fontWeight: 600,
-                  cursor: "pointer",
-                }}
-              >
-                <AppIcon name="Lock" size={11} />
-                פרטי
-              </button>
-              {topicOptions.map((c) => (
-                <button
-                  key={c.id}
-                  onClick={() => updateLibrarySort({ topicFilter: c.id })}
-                  style={{
-                    border: `1.5px solid ${topicFilter === c.id ? c.color : "var(--line-strong)"}`,
-                    background: topicFilter === c.id ? c.color : "transparent",
-                    color: topicFilter === c.id ? "var(--paper)" : "var(--ink)",
-                    borderRadius: 999,
-                    padding: "5px 11px",
-                    fontSize: 11,
-                    fontWeight: 600,
-                    cursor: "pointer",
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 5,
-                  }}
-                >
-                  <AppIcon name={c.icon} size={11} color={topicFilter === c.id ? "var(--paper)" : c.color} />
-                  {c.name}
-                </button>
-              ))}
+              {(() => {
+                // "מאמר מקישור" (webImport) stories are always private (see
+                // storyIsPublic) — pairing that category with "ציבורי" can
+                // only ever produce zero results, which is exactly the
+                // confusing empty-list case this is meant to prevent. So
+                // while that category is the active topic filter, "ציבורי"
+                // is locked out and "פרטי" is locked on. The lock releases
+                // the moment a different topic chip (including "הכל") is
+                // chosen.
+                const webImportLocked = topicFilter === "webImport";
+                // "הכל" here means "no filtering at all" — both category
+                // and visibility wide open — not just "any category". So
+                // selecting it also clears any active פרטי/ציבורי, and it
+                // only shows as the selected chip when nothing else is
+                // narrowing the list.
+                const allSelected = topicFilter === "all" && visFilter === null;
+                return (
+                  <>
+                    <button
+                      onClick={() => updateLibrarySort({ topicFilter: "all", visFilter: null })}
+                      style={{
+                        border: `1.5px solid ${allSelected ? "var(--ink)" : "var(--line-strong)"}`,
+                        background: allSelected ? "var(--ink)" : "transparent",
+                        color: allSelected ? "var(--paper)" : "var(--ink)",
+                        borderRadius: 999,
+                        padding: "5px 11px",
+                        fontSize: 11,
+                        fontWeight: 600,
+                        cursor: "pointer",
+                      }}
+                    >
+                      הכל
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (webImportLocked) return;
+                        toggleVisFilter("public");
+                      }}
+                      disabled={webImportLocked}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        border: `1.5px solid ${visFilter === "public" ? "var(--ink)" : "var(--line-strong)"}`,
+                        background: visFilter === "public" ? "var(--ink)" : "transparent",
+                        color: visFilter === "public" ? "var(--paper)" : "var(--ink)",
+                        borderRadius: 999,
+                        padding: "5px 11px",
+                        fontSize: 11,
+                        fontWeight: 600,
+                        cursor: webImportLocked ? "not-allowed" : "pointer",
+                        opacity: webImportLocked ? 0.4 : 1,
+                      }}
+                    >
+                      <AppIcon name="Globe" size={11} />
+                      ציבורי
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (webImportLocked) return; // locked on, can't toggle off
+                        toggleVisFilter("private");
+                      }}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        border: `1.5px solid ${visFilter === "private" || webImportLocked ? "var(--ink)" : "var(--line-strong)"}`,
+                        background: visFilter === "private" || webImportLocked ? "var(--ink)" : "transparent",
+                        color: visFilter === "private" || webImportLocked ? "var(--paper)" : "var(--ink)",
+                        borderRadius: 999,
+                        padding: "5px 11px",
+                        fontSize: 11,
+                        fontWeight: 600,
+                        cursor: webImportLocked ? "default" : "pointer",
+                      }}
+                    >
+                      <AppIcon name="Lock" size={11} />
+                      פרטי
+                    </button>
+                    {topicOptions.map((c) => (
+                      <button
+                        key={c.id}
+                        onClick={() =>
+                          updateLibrarySort(
+                            c.id === "webImport"
+                              ? { topicFilter: c.id, visFilter: "private" }
+                              : { topicFilter: c.id }
+                          )
+                        }
+                        style={{
+                          border: `1.5px solid ${topicFilter === c.id ? c.color : "var(--line-strong)"}`,
+                          background: topicFilter === c.id ? c.color : "transparent",
+                          color: topicFilter === c.id ? "var(--paper)" : "var(--ink)",
+                          borderRadius: 999,
+                          padding: "5px 11px",
+                          fontSize: 11,
+                          fontWeight: 600,
+                          cursor: "pointer",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 5,
+                        }}
+                      >
+                        <AppIcon name={c.icon} size={11} color={topicFilter === c.id ? "var(--paper)" : c.color} />
+                        {c.name}
+                      </button>
+                    ))}
+                  </>
+                );
+              })()}
             </>
           )}
         </div>
@@ -17443,6 +17703,9 @@ function LibraryView({ state, setState, onOpen, onRequestDelete }) {
                 <div style={{ fontSize: 12, color: "#8a9089" }}>
                   {cat.name} · {generatedChapterCount(s)}/{s.totalChapters} פרקים · {bookSizeBand(s.totalChapters).label}
                 </div>
+                {libraryDateLabel(s) && (
+                  <div style={{ fontSize: 11.5, color: "#8a9089" }}>{libraryDateLabel(s)}</div>
+                )}
                 {sortMode === "lastRead" && (
                   <div style={{ fontSize: 11.5, color: "#3E7C74", fontWeight: 600 }}>{timeAgoLabel(s.lastOpenedAt)}</div>
                 )}
