@@ -1119,8 +1119,8 @@ async function withAutoRetry(task, { attempts = 3, onRetrying } = {}) {
 // built-in procedural sketch illustration instead (never a hard failure).
 // ---------------------------------------------------------------------------
 
-async function generateImageOpenAI(prompt, apiKey) {
-  const model = getImageModel("openai") || IMAGE_MODEL_DEFAULTS.openai;
+async function generateImageOpenAI(prompt, apiKey, modelOverride) {
+  const model = modelOverride || getImageModel("openai") || IMAGE_MODEL_DEFAULTS.openai;
   const response = await fetchWithTimeout("https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: {
@@ -1129,7 +1129,7 @@ async function generateImageOpenAI(prompt, apiKey) {
     },
     body: JSON.stringify({ model, prompt, size: "1024x1024", n: 1 }),
   });
-  if (!response.ok) throw new Error(`OpenAI image request failed: ${response.status} ${await readErrorDetail(response)}`);
+  if (!response.ok) throw await httpError(response);
   const data = await response.json();
   const item = data?.data?.[0];
   if (item?.url) return item.url;
@@ -1137,8 +1137,8 @@ async function generateImageOpenAI(prompt, apiKey) {
   return null;
 }
 
-async function generateImageGoogle(prompt, apiKey) {
-  const model = getImageModel("google") || IMAGE_MODEL_DEFAULTS.google;
+async function generateImageGoogle(prompt, apiKey, modelOverride) {
+  const model = modelOverride || getImageModel("google") || IMAGE_MODEL_DEFAULTS.google;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const response = await fetchWithTimeout(url, {
     method: "POST",
@@ -1148,7 +1148,7 @@ async function generateImageGoogle(prompt, apiKey) {
       generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
     }),
   });
-  if (!response.ok) throw new Error(`Google image request failed: ${response.status} ${await readErrorDetail(response)}`);
+  if (!response.ok) throw await httpError(response);
   const data = await response.json();
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const imgPart = parts.find((p) => p.inlineData && p.inlineData.data);
@@ -1156,17 +1156,113 @@ async function generateImageGoogle(prompt, apiKey) {
   return `data:${imgPart.inlineData.mimeType || "image/png"};base64,${imgPart.inlineData.data}`;
 }
 
+// A model name in the request is unrecognized by the API right now (image
+// model ids get renamed/retired more often than text ones) — worth one
+// silent retry against the built-in default id instead of surfacing a raw
+// 404, but only if the caller wasn't already using that default (no point
+// retrying the exact same id that just failed). This is a different-request
+// retry (new model id), not a repeat of the identical failed call, so it's
+// safe even right after a 429 — see the cooldown note below.
+function isModelNotFoundError(e) {
+  if (!e) return false;
+  if (e.status === 404) return true;
+  return /not found|is not supported|unknown model|no such model/i.test(`${e.detail || ""} ${e.message || ""}`);
+}
+
+// Genuine overload/quota-burst signal, not a real lasting failure — but
+// NOT something to retry inline (see IMAGE_COOLDOWN_MS below for why).
+function isTransientImageError(e) {
+  if (!e) return false;
+  if (e.status === 429 || e.status === 503 || e.status === 500) return true;
+  return /overloaded|unavailable|rate[\s-]?limit|too many requests/i.test(`${e.detail || ""} ${e.message || ""}`);
+}
+
+// ---------------------------------------------------------------------
+// Short, PER-PROVIDER cooldown for image generation specifically — separate
+// from the text pipeline's cooldown (markProviderCooldown/nextCooldownUntil
+// above), which is measured in hours/until-midnight and wrong for this: an
+// image 429 is a short per-minute burst limit, not a daily cap, and using
+// the text cooldown's semantics here would silently turn off illustrations
+// for the rest of the day over one transient burst.
+//
+// WHY THIS MATTERS MORE THAN RETRYING: up to MAX_CONCURRENT_JOBS chapters
+// can be generating illustrations around the same moment. If each one
+// independently retries its own failed call a few times, that's MORE
+// requests hitting an already-overloaded endpoint at once — exactly the
+// flooding behavior that produces cascading 429/503s. A shared cooldown
+// does the opposite: the FIRST 429 anyone hits tells every other
+// in-flight/upcoming illustration call (this chapter and any other) to
+// skip the network call entirely and go straight to the fallback sketch
+// until the cooldown clears — no retry loop, no repeat requests, and the
+// text side of the app is completely unaffected either way.
+const IMAGE_COOLDOWN_MS = 25000;
+function imageCooldownKey(provider) {
+  return `reading-room-image-cooldown-${provider}`;
+}
+function isImageProviderCoolingDown(provider) {
+  try {
+    const until = Number(localStorage.getItem(imageCooldownKey(provider)) || 0);
+    return until > Date.now();
+  } catch {
+    return false;
+  }
+}
+function markImageProviderCooldown(provider) {
+  try {
+    localStorage.setItem(imageCooldownKey(provider), String(Date.now() + IMAGE_COOLDOWN_MS));
+  } catch {}
+}
+function clearImageProviderCooldown(provider) {
+  try {
+    localStorage.removeItem(imageCooldownKey(provider));
+  } catch {}
+}
+
 // Returns an image URL/data-URI on success, or null if this provider simply
-// doesn't support image generation. Throws on an actual failed attempt
-// (bad key, quota, network, etc.) so callers can show the real reason instead
-// of silently downgrading with no explanation.
+// doesn't support image generation. Throws on an actual failed attempt (bad
+// key, network, etc.) so callers can show the real reason instead of
+// silently downgrading with no explanation.
+//
+// Deliberately does NOT retry a transient (429/503/500) failure inline —
+// one clean, fast attempt, then straight to the fallback sketch (see
+// loadChapterImage), marking the shared cooldown above so nothing else
+// piles on right after. The ONE exception is a 404 on the configured model
+// id: that's retried once against the built-in default id, since it's a
+// different request (not hammering the same failing one) and fixes itself
+// permanently instead of just waiting it out.
 async function generateIllustration(prompt) {
   const provider = getEffectiveImageProvider();
   const apiKey = getApiKey(provider);
   if (!apiKey) throw new MissingApiKeyError();
-  if (provider === "openai") return await generateImageOpenAI(prompt, apiKey);
-  if (provider === "google") return await generateImageGoogle(prompt, apiKey);
-  return null; // anthropic / custom: no built-in image generation support (not an error)
+  if (provider !== "openai" && provider !== "google") return null; // anthropic / custom: no built-in image generation support (not an error)
+
+  if (isImageProviderCoolingDown(provider)) {
+    const err = new Error("הספק בהפסקה קצרה אחרי עומס — מנסים שוב בקריאה הבאה.");
+    err.status = 429;
+    throw err;
+  }
+
+  const configuredModel = getImageModel(provider) || IMAGE_MODEL_DEFAULTS[provider];
+  const call = provider === "openai" ? generateImageOpenAI : generateImageGoogle;
+
+  try {
+    const result = await call(prompt, apiKey, configuredModel);
+    clearImageProviderCooldown(provider);
+    return result;
+  } catch (e) {
+    if (isModelNotFoundError(e) && configuredModel !== IMAGE_MODEL_DEFAULTS[provider]) {
+      try {
+        const result = await call(prompt, apiKey, IMAGE_MODEL_DEFAULTS[provider]);
+        clearImageProviderCooldown(provider);
+        return result;
+      } catch (e2) {
+        if (isTransientImageError(e2)) markImageProviderCooldown(provider);
+        throw e2;
+      }
+    }
+    if (isTransientImageError(e)) markImageProviderCooldown(provider);
+    throw e;
+  }
 }
 
 function providerSupportsImages(provider = getEffectiveImageProvider()) {
@@ -1676,10 +1772,40 @@ function formatBytes(n) {
 function arrayField(f) {
   return ((f && f.arrayValue && f.arrayValue.values) || []).map((v) => v.stringValue);
 }
+// Compresses a JSON-serializable value with gzip (level 9 — see
+// PDF_GZIP_OPTIONS) and returns it as a Firestore string field, base64-
+// encoded exactly like a PDF chunk (see uint8ToBase64/pushFileChunksIfMissing
+// above). Used for every JSON blob pushed to Firestore — story records, word
+// records, category/word index lists, settings — not just PDF binaries:
+// JSON's repetitive punctuation, key names and whitespace compresses
+// especially well, and every KB saved here is a KB still free in the shared,
+// pooled ~3GB budget (see CLOUD_BACKEND_CONFIGS).
+function compressJsonToField(value) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  return strField(uint8ToBase64(pako.gzip(bytes, PDF_GZIP_OPTIONS)));
+}
+// Reads back anything written by compressJsonToField — and, transparently,
+// anything written the OLD way too, as plain uncompressed JSON text, before
+// this compression existed. No migration needed: a valid gzip stream always
+// starts with the two magic bytes 0x1f 0x8b once base64-decoded, so that's
+// used to tell the two shapes apart automatically rather than needing a
+// separate flag or field name for "is this one compressed".
 function parseJsonField(field, fallback) {
+  const raw = field && field.stringValue;
+  if (!raw) return fallback;
   try {
-    return field ? JSON.parse(field.stringValue) : fallback;
+    const bytes = base64ToUint8(raw);
+    if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
+      return JSON.parse(new TextDecoder().decode(pako.ungzip(bytes)));
+    }
   } catch (e) {
+    // Not valid base64/gzip at all — fall through and try it as legacy
+    // plain JSON text instead, below.
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error("parseJsonField: value is neither valid compressed nor valid plain JSON:", (e && e.message) || e);
     return fallback;
   }
 }
@@ -1786,11 +1912,11 @@ async function pushBackupFirebase(config, identity, state, onProgress) {
     if (legacyIds.length && onProgress) onProgress(`משדרגים ${legacyIds.length} מילים לפורמט החדש…`);
     for (let i = 0; i < legacyIds.length; i++) {
       const id = legacyIds[i];
-      const payload = JSON.stringify(legacyWords[id]);
+      const field = compressJsonToField(legacyWords[id]);
       await firestoreSet(config, `${BACKUP_COLLECTION}/${docId}/words/${encodeURIComponent(id)}`, {
-        data: strField(payload),
+        data: field,
       });
-      bytesWritten += utf8ByteLength(payload);
+      bytesWritten += field.stringValue.length;
     }
     remoteWordIds = legacyIds;
   }
@@ -1801,21 +1927,21 @@ async function pushBackupFirebase(config, identity, state, onProgress) {
   if (newStoryIds.length && onProgress) onProgress(`מגבים ${newStoryIds.length} ספרים חדשים…`);
   for (let i = 0; i < newStoryIds.length; i++) {
     const id = newStoryIds[i];
-    const payload = JSON.stringify(state.stories[id]);
+    const field = compressJsonToField(state.stories[id]);
     await firestoreSet(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(id)}`, {
-      data: strField(payload),
+      data: field,
     });
-    bytesWritten += utf8ByteLength(payload);
+    bytesWritten += field.stringValue.length;
   }
 
   if (newWordIds.length && onProgress) onProgress(`מגבים ${newWordIds.length} מילים חדשות…`);
   for (let i = 0; i < newWordIds.length; i++) {
     const id = newWordIds[i];
-    const payload = JSON.stringify(state.words[id]);
+    const field = compressJsonToField(state.words[id]);
     await firestoreSet(config, `${BACKUP_COLLECTION}/${docId}/words/${encodeURIComponent(id)}`, {
-      data: strField(payload),
+      data: field,
     });
-    bytesWritten += utf8ByteLength(payload);
+    bytesWritten += field.stringValue.length;
   }
 
   // Also push every imported PDF book's ORIGINAL FILE into this same
@@ -1887,23 +2013,26 @@ async function pushBackupFirebase(config, identity, state, onProgress) {
   // stories/words and no settings changes means there's nothing to save.
   if (!jsonEqual(nextMeta, prevMeta)) {
     if (onProgress) onProgress("מעדכנים גיבוי…");
+    const categoryProgressField = compressJsonToField(nextMeta.categoryProgress);
+    const readingPrefsField = compressJsonToField(nextMeta.readingPrefs);
+    const librarySortField = compressJsonToField(nextMeta.librarySort);
     const metaFields = {
       email: strField(nextMeta.email),
       updatedAt: intField(Date.now()),
       storyIds: { arrayValue: { values: storyIds.map(strField) } },
       wordIds: { arrayValue: { values: wordIds.map(strField) } },
-      categoryProgress: strField(JSON.stringify(nextMeta.categoryProgress)),
-      readingPrefs: strField(JSON.stringify(nextMeta.readingPrefs)),
-      librarySort: strField(JSON.stringify(nextMeta.librarySort)),
+      categoryProgress: categoryProgressField,
+      readingPrefs: readingPrefsField,
+      librarySort: librarySortField,
     };
     await firestoreSet(config, `${BACKUP_COLLECTION}/${docId}`, metaFields);
     bytesWritten +=
       utf8ByteLength(nextMeta.email) +
       utf8ByteLength(JSON.stringify(storyIds)) +
       utf8ByteLength(JSON.stringify(wordIds)) +
-      utf8ByteLength(JSON.stringify(nextMeta.categoryProgress)) +
-      utf8ByteLength(JSON.stringify(nextMeta.readingPrefs)) +
-      utf8ByteLength(JSON.stringify(nextMeta.librarySort));
+      categoryProgressField.stringValue.length +
+      readingPrefsField.stringValue.length +
+      librarySortField.stringValue.length;
   }
 
   return { newStoryCount: newStoryIds.length, newWordCount: newWordIds.length, bytesWritten };
@@ -1941,14 +2070,12 @@ async function pullBackupFirebase(config, identity, localState, onProgress) {
   for (let i = 0; i < missingStoryIds.length; i++) {
     const id = missingStoryIds[i];
     const doc = await firestoreGet(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(id)}`);
-    const raw = doc && doc.fields && doc.fields.data && doc.fields.data.stringValue;
-    if (raw) {
-      try {
-        stories[id] = JSON.parse(raw);
-      } catch (e) {
-        // skip a corrupted story doc rather than failing the whole restore
-      }
-    }
+    // parseJsonField auto-detects gzip-compressed vs legacy plain JSON — see
+    // its own comment above — so a story backed up before compression
+    // existed restores exactly the same way a freshly-compressed one does.
+    const parsed = doc && doc.fields && parseJsonField(doc.fields.data, null);
+    if (parsed) stories[id] = parsed;
+    // (a missing/corrupt doc is skipped rather than failing the whole restore)
   }
 
   const words = {};
@@ -1961,14 +2088,9 @@ async function pullBackupFirebase(config, identity, localState, onProgress) {
     for (let i = 0; i < missingWordIds.length; i++) {
       const id = missingWordIds[i];
       const doc = await firestoreGet(config, `${BACKUP_COLLECTION}/${docId}/words/${encodeURIComponent(id)}`);
-      const raw = doc && doc.fields && doc.fields.data && doc.fields.data.stringValue;
-      if (raw) {
-        try {
-          words[id] = JSON.parse(raw);
-        } catch (e) {
-          // skip a corrupted word doc rather than failing the whole restore
-        }
-      }
+      const parsed = doc && doc.fields && parseJsonField(doc.fields.data, null);
+      if (parsed) words[id] = parsed;
+      // (a missing/corrupt doc is skipped rather than failing the whole restore)
     }
   }
 
@@ -2555,7 +2677,7 @@ async function upsertPublicLibraryIndexEntry(config, story) {
   const idx = entries.findIndex((e) => e.id === story.id);
   if (idx === -1) entries.push(preview);
   else entries[idx] = preview;
-  await firestoreSet(config, path, { entries: strField(JSON.stringify(entries)) });
+  await firestoreSet(config, path, { entries: compressJsonToField(entries) });
 }
 
 // Best-effort, silent push of one story to the public catalog — never
@@ -2574,9 +2696,8 @@ async function pushStoryToPublicLibrary(story) {
     ownerUid = "";
   }
   try {
-    const payload = JSON.stringify(story);
     await firestoreSet(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(story.id)}`, {
-      data: strField(payload),
+      data: compressJsonToField(story),
       categoryId: strField(story.categoryId),
       level: intField(story.level || 1),
       storyTitle: strField(story.storyTitle || ""),
@@ -3022,13 +3143,10 @@ async function fetchPublicLibraryStory(storyId) {
   const config = publicLibraryConfig();
   if (!config) return null;
   const doc = await firestoreGet(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(storyId)}`);
-  const raw = doc && doc.fields && doc.fields.data && doc.fields.data.stringValue;
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    return null;
-  }
+  // parseJsonField auto-detects gzip-compressed vs legacy plain JSON — see
+  // its own comment above — so books published before compression existed
+  // still download exactly the same way a freshly-compressed one does.
+  return (doc && doc.fields && parseJsonField(doc.fields.data, null)) || null;
 }
 
 // Lists every public book across every category in one go (one Firestore
@@ -3116,7 +3234,7 @@ async function upsertPublicWordIndexEntry(config, word, translation) {
   const entry = { word: word.trim(), translation };
   if (idx === -1) list.push(entry);
   else list[idx] = entry;
-  await firestoreSet(config, path, { words: strField(JSON.stringify(list)) });
+  await firestoreSet(config, path, { words: compressJsonToField(list) });
 }
 
 // Best-effort, silent — never throws, never surfaces an error to the reader,
@@ -6031,11 +6149,61 @@ function boldWordInSentence(sentence, word) {
   );
 }
 
+// Isolates the exact, complete sentence within `context` that contains
+// `word` — split on sentence-ending punctuation (. ! ?) — instead of an
+// arbitrary word-count window. A translation model does far better with one
+// full, grammatically complete sentence (subject, verb, full clause
+// structure intact) than with a ragged partial window that may start or end
+// mid-clause, since tense, number and idiom all depend on the sentence's
+// complete grammatical shape. Falls back to the raw context (or the word
+// itself) if no sentence boundary containing the word can be found — e.g. a
+// context with no terminal punctuation at all.
+function extractExactSentence(word, context) {
+  if (!context) return word;
+  const trimmedContext = context.trim();
+  if (!trimmedContext) return word;
+  // Split into sentences, keeping each one's terminating punctuation
+  // attached (a plain /[.!?]/ split would throw the punctuation away).
+  const sentences = trimmedContext.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [trimmedContext];
+  const needle = word.trim().split(/\s+/)[0]?.toLowerCase().replace(/[^a-z']/g, "");
+  if (needle) {
+    const match = sentences.find((s) => s.toLowerCase().includes(needle));
+    if (match) return match.trim();
+  }
+  // Word not found in any single sentence (e.g. it straddles a sentence
+  // boundary in the windowed context) — fall back to the sentence closest to
+  // the middle of the passage, which is where buildLocalTranslationContext
+  // centers its window on the actual clicked token.
+  const middle = sentences[Math.floor(sentences.length / 2)];
+  return (middle || trimmedContext).trim();
+}
+
+// A selection of more than this many words is treated as a full sentence
+// or short passage rather than a word/short-phrase lookup — phrasal verbs
+// and idioms (the main reason a "phrase" selection exists at all) are
+// essentially never longer than this, so anything past the threshold is
+// almost certainly the reader dragging across a whole sentence (or more)
+// and wanting it translated in full, not condensed into a short gloss.
+const SENTENCE_MODE_WORD_THRESHOLD = 6;
+
 async function translateWord(word, context) {
+  const trimmedWord = (word || "").trim();
+  const wordCount = trimmedWord ? trimmedWord.split(/\s+/).length : 0;
+  if (wordCount > SENTENCE_MODE_WORD_THRESHOLD) {
+    return translateFullSentence(trimmedWord, context);
+  }
+
   const system =
-    "You are a precise, careful English-to-Hebrew dictionary helping a language learner who is reading a story in context. Translate the given word or phrase EXACTLY as it functions and means at THIS specific point in the passage — its part of speech, sense, tense/number, and idiom here — not its most common or default dictionary meaning if that differs from how it's actually used here (e.g. a verb given in past tense must be translated in Hebrew past tense, not the infinitive; a word used idiomatically must get its idiomatic Hebrew equivalent, not a literal word-for-word rendering that would sound wrong or nonsensical in Hebrew). Before answering, silently double-check your answer actually fits naturally if substituted into the Hebrew reader's understanding of that exact sentence — if it wouldn't, pick a better one. Use plain, modern, everyday Hebrew a native speaker would actually say — never nikud/vowel points, never archaic or biblical/poetic word choices, never an obscure or overly formal synonym when a simple common word means the same thing. If the exact text given includes a proper noun (a person's name, etc.), keep that name as a normal Hebrew transliteration and translate only the surrounding word(s) — never substitute a different, unrelated Hebrew word for a name. Respond with ONLY the Hebrew translation — 1 to 4 Hebrew words. No quotes, no punctuation, no explanation, nothing else.";
+    "You are a professional English-to-Hebrew translator producing dictionary-grade contextual translations for a language learner reading a story. You will be given ONE complete sentence and a word or phrase from within it. Your task requires absolute contextual precision:\n\n" +
+    "1. GRAMMATICAL EXACTNESS: Translate the word/phrase exactly as it functions in THIS sentence — its precise part of speech, grammatical tense, and singular/plural number — never its default dictionary form if that differs from actual usage here. A past-tense verb must be rendered in Hebrew past tense, not the infinitive or present; a plural noun must be rendered plural; a word used as one part of speech (e.g. a noun used as a verb) must be translated as that same part of speech in Hebrew.\n\n" +
+    "2. PHRASAL VERBS AND IDIOMS AS WHOLE UNITS: If the given word/phrase is (or is part of) a phrasal verb, fixed expression, or idiom (e.g. \"give up\", \"look forward to\", \"break the ice\"), you MUST translate it as a single complete semantic unit using its true Hebrew idiomatic equivalent — NEVER translate it word-by-word/literally. A literal, compositional translation that would sound nonsensical, wrong, or merely 'foreign-literal' to a native Hebrew speaker is a failure. Identify the real meaning of the whole expression in context first, then find how a native Hebrew speaker would actually express that same meaning.\n\n" +
+    "3. NATURAL MODERN HEBREW: Output only fluent, natural, contemporary spoken/written Hebrew — the way a native speaker would really say it today. Never use nikud (vowel points). Never use archaic, biblical, liturgical, or overly literary/poetic vocabulary. Never choose an obscure, overly formal, or academic synonym when a simple, common word conveys the same meaning.\n\n" +
+    "4. NAMES: If the given text is or includes a proper noun (a person's or place's name), keep it as a standard Hebrew transliteration and translate only any surrounding word(s) — never substitute an unrelated Hebrew word for a name.\n\n" +
+    "Before answering, silently re-read the full sentence with your Hebrew translation substituted in place of the original word/phrase, and verify it reads as something a native Hebrew speaker would naturally say — matching tense, number, part of speech and idiom exactly. If it doesn't fit perfectly, revise it before responding.\n\n" +
+    "Respond with ONLY the final Hebrew translation, 1 to 4 words, no nikud, no quotes, no punctuation, no explanation — nothing else.";
   const localContext = localTranslationContext(word, context);
-  const user = `Passage:\n"""${localContext}"""\n\nWord or phrase to translate, exactly as it is used in THIS passage: "${word}"`;
+  const exactSentence = extractExactSentence(word, localContext);
+  const user = `Sentence:\n"""${exactSentence}"""\n\nWord or phrase to translate, exactly as it is used in THIS sentence: "${word}"`;
   // A translation is a few words at most — an explicit small ceiling instead
   // of the 1000-token default keeps this call's worst case cheap.
   try {
@@ -6047,6 +6215,38 @@ async function translateWord(word, context) {
     // 429/rate-limit, an auth problem, and a genuinely broken model all
     // look identical to the person using the app.
     console.error("translateWord failed:", e?.status, e?.message || e);
+    throw e;
+  }
+}
+
+// Full-sentence / short-passage translation — used when the reader selects
+// a whole sentence (or a short multi-sentence passage) rather than a single
+// word or short idiom. Unlike translateWord's dictionary-style 1-4-word
+// gloss, this must render EVERY word of the source, start to finish: no
+// shortening, no dropped clauses, no "summary" of the gist. The literary
+// register matters here too — this is prose from a story or an expository
+// text, not a dictionary entry, so the Hebrew must read as real, fluent,
+// standard (תקנית) Hebrew prose that a native speaker would actually write,
+// while staying faithful to the source's exact meaning and nuance.
+async function translateFullSentence(text, context) {
+  const system =
+    "You are a professional literary and expository translator producing publication-quality Hebrew translations of full sentences and short passages for a language learner reading a story or informational text. You will be given a passage of surrounding context (for reference/disambiguation only) and a complete sentence or short passage to translate. Requirements:\n\n" +
+    "1. COMPLETE, UNABRIDGED TRANSLATION: Translate the ENTIRE given text from its very first word to its very last word. Every clause and every sentence in the source must appear, translated, in your output. NEVER skip, drop, merge, paraphrase-away, condense, or summarize any part of it — however long the passage is. The Hebrew translation must be a full, faithful rendering of the complete source text, not a shortened version, a gist, or a synopsis.\n\n" +
+    "2. STANDARD, FLUENT, NATURAL HEBREW: Write in fluent, grammatically correct standard modern Hebrew (עברית תקנית) that reads as genuine, natural prose a native speaker would actually write — not a stiff or overly literal word-for-word rendering. Preserve the source's exact meaning, tone, register, and nuance (literary passages should read like literary Hebrew prose; expository/informational passages should read like clear expository Hebrew prose). Never use nikud (vowel points).\n\n" +
+    "3. CONTEXTUAL ACCURACY: Use the surrounding context only to resolve ambiguity (pronoun references, word sense, idioms) — translate ONLY the given text itself, not the surrounding context around it.\n\n" +
+    "4. NAMES: Render proper nouns (people, places) as standard Hebrew transliterations; do not substitute unrelated Hebrew words for names.\n\n" +
+    "Before answering, silently verify that every sentence and clause of the source is represented in your Hebrew translation and that nothing was omitted or condensed. Respond with ONLY the complete Hebrew translation of the given text — no preamble, no quotes, no explanation, nothing else.";
+  const localContext = localTranslationContext(text, context, 150);
+  const user = `Surrounding context (for reference only — do NOT translate this part, use it only to resolve ambiguity):\n"""${localContext}"""\n\nFull text to translate, in its entirety, omitting nothing:\n"""${text}"""`;
+  // Unlike the short dictionary lookup, a full-sentence/passage translation
+  // can legitimately run long — size the ceiling to the input so longer
+  // selections aren't cut off mid-sentence.
+  const maxTokens = Math.min(1500, Math.max(300, Math.ceil(text.length * 1.5)));
+  try {
+    const raw = await callClaude(system, user, maxTokens);
+    return raw.trim().replace(/^["'\u05f4\u05f3]+|["'\u05f4\u05f3]+$/g, "");
+  } catch (e) {
+    console.error("translateFullSentence failed:", e?.status, e?.message || e);
     throw e;
   }
 }
@@ -6076,7 +6276,14 @@ async function translateWord(word, context) {
 // stay a single whole-passage call (a rhyme pair can sit far apart in the
 // text, so chunking would sever real pairs), just with a much larger token
 // budget and the same exhaustiveness instructions.
-const GRAMMAR_CHUNK_TARGET_WORDS = 450;
+// Kept deliberately small (a short paragraph's worth, not a whole page) —
+// smaller chunks mean each AI call has far less text to scan and far fewer
+// spans to return, which is what actually avoids slow responses/time-outs.
+// Bigger chunks did not meaningfully reduce the number of network calls
+// anyway, because the module-level queue below (createConcurrencyLimiter)
+// already paces how many run at once — they just made EACH call slower and
+// more likely to be cut off, which is the opposite of what we want.
+const GRAMMAR_CHUNK_TARGET_WORDS = 180;
 // Chunking (above) multiplies how many network calls ONE rule on ONE
 // chapter makes, and the reader can turn on many rules at once (there's a
 // "mark all" button — dozens of curriculum rules by the higher levels).
@@ -6120,76 +6327,89 @@ const runGrammarScanCall = createConcurrencyLimiter(3);
 function chunkTextForGrammarScan(content) {
   const rawParagraphs = content.split(/\n+/).filter((p) => p.trim());
   const paragraphs = rawParagraphs.length ? rawParagraphs : [content];
-  // A single "paragraph" can itself be far larger than the target chunk
-  // size — routine in PDF imports, where paragraph breaks are frequently
-  // lost during extraction and a whole chapter (or even the whole book)
-  // arrives as one unbroken blob of text with no blank lines at all. Left
-  // alone, that collapses the chunking below into one giant chunk covering
-  // the entire chapter, exactly the failure mode this whole function exists
-  // to avoid (see the big comment above findGrammarSpans) — so any
-  // oversized paragraph is first split further on sentence boundaries,
-  // guaranteeing no unit handed to the chunker below is ever more than
-  // ~1.5x the target size, regardless of how the source text is broken up.
+  // Always break every paragraph down to individual-sentence units first —
+  // not just oversized ones. A whole unbroken chapter (common after PDF
+  // import, where paragraph breaks are frequently lost) and a short,
+  // dialogue-heavy paragraph both go through the exact same path, so the
+  // pieces handed to the chunker below are always precise, sentence-sized
+  // units, never an accidental multi-paragraph blob. Short paragraphs with
+  // only one "sentence" (e.g. a single line of dialogue) come through
+  // untouched — there's nothing to split.
+  //
+  // Sentences are pushed WITHOUT trimming their captured trailing
+  // whitespace, and chunks below are reassembled with "" between units of
+  // the same paragraph / "\n\n" at real paragraph boundaries (see
+  // joinUnits) — together this guarantees every chunk is a byte-for-byte
+  // exact substring of the original content. That matters downstream: the
+  // model is asked to copy spans verbatim, and highlighting them back in
+  // the reader works by a plain indexOf() against the original chapter
+  // text (see buildHighlightRanges) — any reformatting here would silently
+  // break that match for spans crossing a sentence boundary.
   const units = [];
   paragraphs.forEach((p) => {
-    const words = p.trim().split(/\s+/).filter(Boolean).length;
-    if (words <= GRAMMAR_CHUNK_TARGET_WORDS * 1.5) {
-      units.push(p);
-      return;
-    }
-    const sentences = p.match(/[^.!?]+[.!?]+(?:\s+|$)/g) || [p];
-    let current = "";
-    let currentWords = 0;
-    sentences.forEach((sentence) => {
-      const sWords = sentence.trim().split(/\s+/).filter(Boolean).length;
-      if (current && currentWords + sWords > GRAMMAR_CHUNK_TARGET_WORDS) {
-        units.push(current);
-        current = "";
-        currentWords = 0;
-      }
-      current += sentence;
-      currentWords += sWords;
-    });
-    if (current.trim()) units.push(current);
+    if (!p.trim()) return;
+    const sentences = p.match(/[^.!?]+[.!?]+\s*|[^.!?]+$/g);
+    const parts = !sentences || sentences.length <= 1 ? [p] : sentences.filter((s) => s.trim());
+    parts.forEach((sentence, i) => units.push({ text: sentence, newParagraph: i === 0 }));
   });
   if (!units.length) return [content];
 
+  // Re-group the small sentence units back into chunks up to the target
+  // size, so a single call still covers a natural short paragraph's worth
+  // of text (better context for the model) rather than one lone sentence
+  // per call (which would multiply network calls far more than needed).
+  // Because every unit is already sentence-sized, a chunk can never
+  // balloon past ~target + one sentence, regardless of how the source text
+  // was originally broken into paragraphs.
+  function joinUnits(list) {
+    return list.map((u, i) => (i > 0 && u.newParagraph ? "\n\n" + u.text : u.text)).join("");
+  }
   const chunks = [];
   let current = [];
   let currentWords = 0;
-  for (const p of units) {
-    const words = p.trim().split(/\s+/).filter(Boolean).length;
+  for (const u of units) {
+    const words = u.text.trim().split(/\s+/).filter(Boolean).length;
     if (current.length && currentWords + words > GRAMMAR_CHUNK_TARGET_WORDS) {
-      chunks.push(current.join("\n\n"));
+      chunks.push(joinUnits(current));
       current = [];
       currentWords = 0;
     }
-    current.push(p);
+    current.push(u);
     currentWords += words;
   }
-  if (current.length) chunks.push(current.join("\n\n"));
+  if (current.length) chunks.push(joinUnits(current));
   return chunks;
 }
 async function findGrammarSpansInChunk(chunk, rule) {
   const system =
     "You find EVERY single example of a specific English grammar rule inside a given passage — this is exhaustive extraction, not a sample of a few representative examples. Read the passage carefully, sentence by sentence, from beginning to end, and list every instance that matches, even if the same structure appears many times in a row — a common structure appearing 10, 20, or more times in the passage means 10, 20, or more entries in your answer, not one or two token examples. Missing even a single genuine instance is an error. You quote text VERBATIM — copying character-for-character from the passage, never paraphrasing, never fixing anything, never adding or removing words. Output ONLY valid JSON, no markdown fences, no commentary.";
   const user = `Passage:\n"""${chunk}"""\n\nGrammar rule to find: ${rule.title} — ${rule.structure}\n\nReturn ONLY this JSON shape: {"spans": ["exact phrase or sentence copied from the passage", "..."]}. Include EVERY distinct instance found anywhere in this passage — scan all of it, not just the opening lines. Each span must be an exact substring of the passage above, copied exactly, including original punctuation. If the rule genuinely does not appear at all, return {"spans": []}.`;
-  const raw = await runGrammarScanCall(() => callClaude(system, user, 2200));
+  // Chunks are now short (see GRAMMAR_CHUNK_TARGET_WORDS above), so a much
+  // smaller output budget is plenty — and, just as importantly, keeps each
+  // individual call fast, which is the main defense against time-outs.
+  const raw = await runGrammarScanCall(() => callClaude(system, user, 1400));
   const parsed = JSON.parse(cleanJson(raw));
   return Array.isArray(parsed.spans) ? parsed.spans.filter((s) => typeof s === "string" && s.trim()) : [];
 }
-async function findGrammarSpans(chapterContent, rule) {
+// onProgress, if given, is called as (done, total) after every chunk
+// settles (success OR failure) — used to drive a visible progress
+// indicator instead of leaving the reader looking at an indefinite spinner
+// while a long chapter is being scanned chunk by chunk.
+async function findGrammarSpans(chapterContent, rule, onProgress) {
   if (rule.paired) {
+    onProgress && onProgress(0, 1);
     const system =
       "You find EVERY example of a specific English poetic device inside a given passage — this is exhaustive extraction, not a sample of a few representative examples. Each example is a GROUP of two or more related exact phrases (e.g. all the words that rhyme with each other, a repeated line and its repetition, or the words sharing an alliterative sound). Scan the ENTIRE passage from start to finish and include every group you find, however many there are — do not stop after the first few. You quote text VERBATIM — copying character-for-character from the passage, never paraphrasing, never fixing anything, never adding or removing words. Output ONLY valid JSON, no markdown fences, no commentary.";
     const user = `Passage:\n"""${chapterContent}"""\n\nPoetic device to find: ${rule.title} — ${rule.structure}\n\nReturn ONLY this JSON shape: {"groups": [["exact phrase 1 copied from the passage", "exact phrase 2 copied from the passage"], ["...", "..."]]}. Each inner array is ONE group of two or more related spans that belong together (e.g. one rhyme pair/set, or one repeated line together with its repetition). Every span must be an exact substring of the passage above, copied exactly, including original punctuation. Include EVERY distinct group found anywhere in the passage — scan start to finish, not just the opening lines; skip any instance that doesn't have at least one matching partner in the passage.`;
     let raw = await runGrammarScanCall(() => callClaude(system, user, 4000));
     try {
       const parsed = JSON.parse(cleanJson(raw));
+      onProgress && onProgress(1, 1);
       return Array.isArray(parsed.groups) ? parsed.groups.filter((g) => Array.isArray(g) && g.length) : [];
     } catch (e) {
       raw = await runGrammarScanCall(() => callClaude(system, user, 4000)); // one retry — a malformed/truncated response is usually a one-off
       const parsed = JSON.parse(cleanJson(raw));
+      onProgress && onProgress(1, 1);
       return Array.isArray(parsed.groups) ? parsed.groups.filter((g) => Array.isArray(g) && g.length) : [];
     }
   }
@@ -6201,17 +6421,24 @@ async function findGrammarSpans(chapterContent, rule) {
   // retry) only costs that chunk's slice of the chapter, never the whole
   // result.
   const chunks = chunkTextForGrammarScan(chapterContent);
+  const total = chunks.length;
+  let doneCount = 0;
+  onProgress && onProgress(0, total);
   const perChunkSpans = await Promise.all(
     chunks.map(async (chunk) => {
+      let result;
       try {
-        return await findGrammarSpansInChunk(chunk, rule);
+        result = await findGrammarSpansInChunk(chunk, rule);
       } catch (e) {
         try {
-          return await findGrammarSpansInChunk(chunk, rule);
+          result = await findGrammarSpansInChunk(chunk, rule);
         } catch (e2) {
-          return [];
+          result = [];
         }
       }
+      doneCount++;
+      onProgress && onProgress(doneCount, total);
+      return result;
     })
   );
   const seen = new Set();
@@ -6225,6 +6452,70 @@ async function findGrammarSpans(chapterContent, rule) {
     }
   }
   return spans.map((s) => [s]); // uniform shape: each lone span is its own single-item group
+}
+
+// ---------------------------------------------------------------------------
+// Local cache for grammar-scan results (findGrammarSpans), keyed per
+// story+chapter+rule. This is what makes marking the SAME rule again in the
+// SAME chapter instant: once a rule has genuinely been scanned there, the
+// result is written to localStorage, and every future toggle-on reads it
+// straight back with zero network calls — no spinner, no waiting on the AI
+// again. A tiny hash of the chapter's own text is stored alongside the
+// spans and checked on every read, so if the chapter's content ever changes
+// (re-generated, edited, re-imported) the stale cache entry is ignored
+// automatically instead of silently showing wrong/missing highlights.
+// ---------------------------------------------------------------------------
+const GRAMMAR_SPAN_CACHE_PREFIX = "grammar-spans-v1::";
+// Cheap, fast string hash (not cryptographic — just needs to change when the
+// text changes) so we're not storing/comparing whole chapter texts just to
+// know if the cache is still valid.
+function quickTextHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = (h * 31 + str.charCodeAt(i)) | 0;
+  }
+  return h.toString(36) + ":" + str.length;
+}
+function grammarSpanCacheKey(storyId, chapterIndex, ruleKeyVal) {
+  return `${GRAMMAR_SPAN_CACHE_PREFIX}${storyId}::${chapterIndex}::${ruleKeyVal}`;
+}
+// Returns the cached groups (same shape findGrammarSpans returns) if a
+// valid, up-to-date entry exists, otherwise null.
+function getCachedGrammarSpans(storyId, chapterIndex, ruleKeyVal, chapterContent) {
+  if (!storyId) return null;
+  try {
+    const raw = localStorage.getItem(grammarSpanCacheKey(storyId, chapterIndex, ruleKeyVal));
+    if (raw == null) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.contentHash !== quickTextHash(chapterContent) || !Array.isArray(parsed.groups)) return null;
+    return parsed.groups;
+  } catch (e) {
+    return null;
+  }
+}
+function setCachedGrammarSpans(storyId, chapterIndex, ruleKeyVal, chapterContent, groups) {
+  if (!storyId) return;
+  try {
+    localStorage.setItem(
+      grammarSpanCacheKey(storyId, chapterIndex, ruleKeyVal),
+      JSON.stringify({ contentHash: quickTextHash(chapterContent), groups, ts: Date.now() })
+    );
+  } catch (e) {
+    // localStorage full/blocked (e.g. private browsing) — degrade
+    // gracefully: results just won't persist between visits, everything
+    // else keeps working exactly as if caching didn't exist.
+  }
+}
+// Removes every cached grammar-span result for one story (called when a
+// story/book is deleted, so its cache entries don't linger forever).
+function clearGrammarSpanCacheForStory(storyId) {
+  if (!storyId) return;
+  try {
+    const prefix = `${GRAMMAR_SPAN_CACHE_PREFIX}${storyId}::`;
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith(prefix))
+      .forEach((k) => localStorage.removeItem(k));
+  } catch (e) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -9217,7 +9508,7 @@ function StoryArt({ seed, color, motif, height = 170 }) {
   );
 }
 
-function ChapterImage({ seed, color, motif, chapter }) {
+function ChapterImage({ seed, color, motif, chapter, onRetry }) {
   const status = chapter && chapter.imageStatus;
   const pdfImages = chapter && chapter.pdfImages;
   // These chapters get their illustrations from the original PDF itself,
@@ -9262,12 +9553,37 @@ function ChapterImage({ seed, color, motif, chapter }) {
   }
   // "none" (unsupported provider / generation failed) or legacy chapters
   // with no image fields at all — always falls back to the free, instant,
-  // guaranteed-to-render procedural illustration.
+  // guaranteed-to-render procedural illustration. Never a crash, never a
+  // stuck screen — worst case the reader sees this sketch plus (when there
+  // really was a failed real-illustration attempt, as opposed to simply an
+  // unsupported provider) a small note and a button to try again.
   return (
     <div style={{ margin: "4px 0 16px 0" }}>
       <StoryArt seed={seed} color={color} motif={motif} />
       {chapter && chapter.imageError && (
-        <div style={{ fontSize: 10.5, color: "#8B3A3A", marginTop: 4, opacity: 0.75 }}>לא נוצר איור אמיתי לקטע זה (מוצג שרטוט חלופי)</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 10.5, color: "#8B3A3A", opacity: 0.75 }}>לא נוצר איור אמיתי לקטע זה (מוצג שרטוט חלופי)</div>
+          {onRetry && (
+            <button
+              onClick={onRetry}
+              style={{
+                fontSize: 10.5,
+                color,
+                background: `${color}12`,
+                border: `1px solid ${color}40`,
+                borderRadius: 8,
+                padding: "3px 8px",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+              }}
+            >
+              <AppIcon name="RefreshCw" size={11} />
+              טען איור מחדש
+            </button>
+          )}
+        </div>
       )}
     </div>
   );
@@ -10447,33 +10763,74 @@ function App() {
 
   // Tries to generate a REAL illustration of this specific passage (only
   // works with providers that support image generation — OpenAI/Google).
-  // Fires in the background; never blocks the chapter text from showing.
-  // If unsupported/unavailable/fails for any reason, falls back to the
-  // built-in procedural sketch illustration (imageStatus "none"), which
-  // always renders regardless.
-  async function loadChapterImage(storyId, chapterIndex, imagePrompt, chapterContent) {
+  // Fires in the background; never blocks the chapter text from showing —
+  // the chapter's text is always already committed to state and on screen
+  // before any caller invokes this (it's never awaited on the critical
+  // path). If unsupported/unavailable/fails for any reason, falls back to
+  // the built-in procedural sketch illustration (imageStatus "none"), which
+  // always renders regardless — the reader is never left with a crashed or
+  // stuck screen.
+  //
+  // `throttleMs` is a small mandatory delay BEFORE the image call actually
+  // fires (default ~2.5s, randomized a bit so back-to-back chapters don't
+  // all hit the API in the exact same instant). This is deliberate,
+  // low-tech throttling: it spaces out the text call (which just finished)
+  // from the image call, and spaces out consecutive chapters' image calls
+  // from each other, which is what actually avoids tripping Google's 429
+  // burst limits in practice — on top of the retry/backoff already inside
+  // generateIllustration for the odd transient 429/503 that still occurs.
+  async function loadChapterImage(storyId, chapterIndex, imagePrompt, chapterContent, throttleMs = 2000 + Math.random() * 1000) {
+    if (throttleMs > 0) await sleep(throttleMs);
     let url = null;
     let imageError = null;
+    let resolvedPrompt = imagePrompt && imagePrompt.trim() ? imagePrompt.trim() : null;
     if (providerSupportsImages()) {
       try {
         // Normally the scene description already arrived bundled with the
         // chapter content (see generateChapter) — this only falls back to a
         // separate API call for older/cached data missing that field.
-        const scene = imagePrompt && imagePrompt.trim() ? imagePrompt.trim() : await describeSceneForImage(chapterContent);
+        const scene = resolvedPrompt || (await describeSceneForImage(chapterContent));
+        resolvedPrompt = scene;
         url = await generateIllustration(`${scene} Style: ${ILLUSTRATION_STYLE}`);
         if (!url) imageError = "הספק לא החזיר תמונה (ייתכן חסימת תוכן בטוחה מצדו).";
       } catch (e) {
         url = null;
-        imageError = e.message || "שגיאה לא ידועה ביצירת האיור";
+        imageError = describeGenerationError(e, "שגיאה ביצירת האיור");
       }
     }
     setState((prev) => {
       const s = prev.stories[storyId];
       if (!s || !s.chapters[chapterIndex]) return prev;
       const chapters = s.chapters.slice();
-      chapters[chapterIndex] = { ...chapters[chapterIndex], image: url, imageStatus: url ? "done" : "none", imageError: url ? null : imageError };
+      chapters[chapterIndex] = {
+        ...chapters[chapterIndex],
+        image: url,
+        imageStatus: url ? "done" : "none",
+        imageError: url ? null : imageError,
+        // Kept so a manual "טען איור מחדש" retry (see ChapterImage) can
+        // reuse the exact same scene description instead of paying for
+        // another describeSceneForImage call just to try the image again.
+        imagePrompt: resolvedPrompt || chapters[chapterIndex].imagePrompt || null,
+      };
       return { ...prev, stories: { ...prev.stories, [storyId]: { ...s, chapters } } };
     });
+  }
+
+  // Manual retry, wired to the "טען איור מחדש" button shown alongside the
+  // fallback sketch (see ChapterImage). Re-enters loading state so the
+  // reader gets the same spinner as first-load, and skips the throttle
+  // delay since this is an explicit, deliberate re-request — not part of a
+  // burst of automatic chapter creations.
+  function retryChapterImage(storyId, chapterIndex) {
+    setState((prev) => {
+      const s = prev.stories[storyId];
+      if (!s || !s.chapters[chapterIndex]) return prev;
+      const chapters = s.chapters.slice();
+      chapters[chapterIndex] = { ...chapters[chapterIndex], imageStatus: "loading", imageError: null };
+      return { ...prev, stories: { ...prev.stories, [storyId]: { ...s, chapters } } };
+    });
+    const chapter = state.stories[storyId]?.chapters[chapterIndex];
+    loadChapterImage(storyId, chapterIndex, chapter?.imagePrompt || null, chapter?.content || "", 0);
   }
 
   async function startNextStory(advanceLevel) {
@@ -10672,6 +11029,7 @@ function App() {
       });
       return { ...prev, stories, words };
     });
+    clearGrammarSpanCacheForStory(storyId);
     if (story && story.isImported) {
       try {
         const db = await openPdfDb();
@@ -11092,6 +11450,7 @@ function App() {
             loadingJob={activeChapterJob || null}
             wordJumpTarget={pendingWordJump && pendingWordJump.storyId === activeStoryId ? pendingWordJump : null}
             onConsumeWordJump={() => setPendingWordJump(null)}
+            onRetryChapterImage={retryChapterImage}
           />
         )}
         {view === "words" && <WordsView state={state} setState={setState} onOpenStory={openWordSource} />}
@@ -12639,6 +12998,36 @@ function PublicLibraryView({ state, onDownload, onOpenStory, onBack }) {
 }
 
 
+// Small horizontal progress bar shown while a rule's chunks are being
+// scanned, so a longer chapter (more chunks) visibly fills in instead of
+// leaving the reader staring at a spinner with no sense of how much is
+// left. total === 0 means chunk count isn't known yet (the very first
+// instant of a scan) — shown as a slim indeterminate/empty bar rather than
+// a misleading 0%.
+function GrammarScanProgressBar({ progress }) {
+  const total = progress && progress.total;
+  const done = (progress && progress.done) || 0;
+  const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, width: "100%" }}>
+      <div style={{ flex: 1, height: 5, borderRadius: 3, background: "var(--line)", overflow: "hidden" }}>
+        <div
+          style={{
+            height: "100%",
+            width: `${pct}%`,
+            background: "#3E7C74",
+            borderRadius: 3,
+            transition: "width 0.25s ease",
+          }}
+        />
+      </div>
+      <span style={{ fontSize: 11, color: "#8a9089", fontFamily: "'IBM Plex Mono', monospace", flexShrink: 0, minWidth: 30, textAlign: "left" }}>
+        {total ? `${pct}%` : "…"}
+      </span>
+    </div>
+  );
+}
+
 function RuleHighlightModal({
   title,
   cumulativeHeading,
@@ -12729,7 +13118,10 @@ function RuleHighlightModal({
                     >
                       {state && state.loading ? (
                         <>
-                          <AppIcon name="Loader2" className="spin" size={13} /> מסמן…
+                          <AppIcon name="Loader2" className="spin" size={13} />
+                          {state.progress && state.progress.total
+                            ? `מסמן… ${Math.min(100, Math.round((state.progress.done / state.progress.total) * 100))}%`
+                            : "מסמן…"}
                         </>
                       ) : state ? (
                         "בטל סימון דקדוק"
@@ -12741,6 +13133,11 @@ function RuleHighlightModal({
                       <span style={{ fontSize: 11.5, color: "#8a9089" }}>לא נמצאה דוגמה מפורשת בפרק הזה</span>
                     )}
                   </div>
+                  {state && state.loading && (
+                    <div style={{ margin: "-6px 0 12px 0" }}>
+                      <GrammarScanProgressBar progress={state.progress} />
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -12782,7 +13179,16 @@ function RuleHighlightModal({
                 />
                 <span style={{ fontFamily: "'IBM Plex Mono', monospace", color, fontWeight: 600, fontSize: 12.5, flexShrink: 0 }}>L{g.level}</span>
                 <span style={{ fontSize: 12.5, color: "#3d453f", flex: 1, minWidth: 0 }}>{g.heTitle}</span>
-                {state && state.loading && <AppIcon name="Loader2" className="spin" size={12} color="#8a9089" />}
+                {state && state.loading && (
+                  <span style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                    <AppIcon name="Loader2" className="spin" size={12} color="#8a9089" />
+                    {state.progress && state.progress.total ? (
+                      <span style={{ fontSize: 10.5, color: "#8a9089", fontFamily: "'IBM Plex Mono', monospace" }}>
+                        {Math.min(100, Math.round((state.progress.done / state.progress.total) * 100))}%
+                      </span>
+                    ) : null}
+                  </span>
+                )}
               </div>
             );
           })}
@@ -14246,7 +14652,7 @@ function CoverPageView({ story, category, isFront, onBack, onToggleLiked, onTouc
   );
 }
 
-function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectChapter, onSuppressNextScrollReset, savedWordsLower, onWordClick: onWordClickProp, onNextChapter, onStartNext, onGoToPreviousLevel, onGoToNextLevel, hasPreviousLevelStory, hasNextLevelStory, onToggleRead, onToggleLiked, onBack, errorMsg, phraseMode, setPhraseMode, phraseAnchor, setPhraseAnchor, readingPrefs, isGeneratingThisChapter, loadingJob, wordJumpTarget, onConsumeWordJump }) {
+function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectChapter, onSuppressNextScrollReset, savedWordsLower, onWordClick: onWordClickProp, onNextChapter, onStartNext, onGoToPreviousLevel, onGoToNextLevel, hasPreviousLevelStory, hasNextLevelStory, onToggleRead, onToggleLiked, onBack, errorMsg, phraseMode, setPhraseMode, phraseAnchor, setPhraseAnchor, readingPrefs, isGeneratingThisChapter, loadingJob, wordJumpTarget, onConsumeWordJump, onRetryChapterImage }) {
   // Shared by every row-1 toolbar button so they all shrink together to fit
   // the row exactly (flex:1 + minWidth:0), instead of some staying full size
   // while others get squeezed. The label itself gets ellipsis as a last
@@ -14933,7 +15339,12 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
     const out = {};
     Object.entries(grammarHighlights).forEach(([key, h]) => {
       const forChapter = h.byChapter[chapterIndex];
-      out[key] = { loading: !forChapter || forChapter.loading, spans: (forChapter && forChapter.groups) || [], color: h.color };
+      out[key] = {
+        loading: !forChapter || forChapter.loading,
+        spans: (forChapter && forChapter.groups) || [],
+        color: h.color,
+        progress: forChapter && forChapter.progress,
+      };
     });
     return out;
   }, [grammarHighlights, chapterIndex]);
@@ -14967,14 +15378,38 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
   }, [grammarHighlights, chapter.content, bookSearchHit, bookSearchQuery, chapterIndex, activeGroup]);
 
   // Fetches (or re-fetches) the spans for one active rule in one chapter.
+  // Local-cache fast path: if this exact rule was already scanned for this
+  // exact chapter content before, the result comes straight back from
+  // localStorage with no network call at all — genuinely instant, not just
+  // "fast". Only a real cache miss falls through to the AI scan, in which
+  // case onProgress keeps the reader informed of exactly how much of the
+  // chapter has been scanned so far instead of an indefinite spinner.
   async function fetchRuleForChapter(key, rule, chapterIdx, content) {
+    const cached = getCachedGrammarSpans(story.id, chapterIdx, key, content);
+    if (cached) {
+      setGrammarHighlights((prev) => {
+        const entry = prev[key];
+        if (!entry) return prev; // rule was turned off before this ran
+        return { ...prev, [key]: { ...entry, byChapter: { ...entry.byChapter, [chapterIdx]: { loading: false, groups: cached } } } };
+      });
+      return;
+    }
     setGrammarHighlights((prev) => {
       const entry = prev[key];
       if (!entry) return prev; // rule was turned off before this ran
-      return { ...prev, [key]: { ...entry, byChapter: { ...entry.byChapter, [chapterIdx]: { loading: true, groups: [] } } } };
+      return { ...prev, [key]: { ...entry, byChapter: { ...entry.byChapter, [chapterIdx]: { loading: true, groups: [], progress: { done: 0, total: 0 } } } } };
     });
+    function reportProgress(done, total) {
+      setGrammarHighlights((prev) => {
+        const entry = prev[key];
+        const forChapter = entry && entry.byChapter[chapterIdx];
+        if (!entry || !forChapter || !forChapter.loading) return prev; // turned off / already resolved
+        return { ...prev, [key]: { ...entry, byChapter: { ...entry.byChapter, [chapterIdx]: { ...forChapter, progress: { done, total } } } } };
+      });
+    }
     try {
-      const groups = await findGrammarSpans(content, rule);
+      const groups = await findGrammarSpans(content, rule, reportProgress);
+      setCachedGrammarSpans(story.id, chapterIdx, key, content, groups);
       setGrammarHighlights((prev) => {
         const entry = prev[key];
         if (!entry) return prev; // turned off while loading
@@ -15567,6 +16002,35 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
             phraseAnchor={phraseAnchor}
           />
         </div>
+        {story.categoryId === "webImport" && story.standfirst && (
+          // The article's standfirst/deck — the one-line summary between
+          // headline and body on the original page. Lives right under the
+          // main title (which is only ever shown ONCE, up here) rather than
+          // inside the reading box below, which used to repeat the headline
+          // a second time right above this same text.
+          <div
+            style={{
+              fontFamily: "'Lora', serif",
+              fontSize: 15.5,
+              fontWeight: 600,
+              fontStyle: "italic",
+              color: "#5c665f",
+              lineHeight: 1.55,
+              direction: "ltr",
+              textAlign: "left",
+              marginTop: 6,
+            }}
+          >
+            <ClickableText
+              as="span"
+              content={story.standfirst}
+              source="story-standfirst"
+              savedWordsLower={savedWordsLower}
+              onWordClick={onWordClick}
+              phraseAnchor={phraseAnchor}
+            />
+          </div>
+        )}
         {story.source && (
           <div
             style={{
@@ -15714,9 +16178,14 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
           touchAction: "pan-y",
         }}
       >
-        {(story.totalChapters > 1 || story.categoryId === "webImport") && (!paginated || pageIndex === 0) && (
+        {/* A web-imported article is always exactly one "chapter" whose
+            title is identical to story.storyTitle, already shown once in
+            the page header above (see there) — showing it again here would
+            just duplicate it. Its standfirst moved up there too. So this
+            whole title block is for multi-chapter books only. */}
+        {story.totalChapters > 1 && (!paginated || pageIndex === 0) && (
           <div style={{ marginBottom: 14, direction: "ltr", textAlign: "left" }}>
-            {story.totalChapters > 1 && !/^chapter\s+\S+\s*[:.\-–]/i.test((chapter.title || "").trim()) && (
+            {!/^chapter\s+\S+\s*[:.\-–]/i.test((chapter.title || "").trim()) && (
               <div
                 style={{
                   fontFamily: "'IBM Plex Mono', monospace",
@@ -15741,36 +16210,10 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
                 speakingOffset={headingHighlightOffset}
               />
             </div>
-            {story.categoryId === "webImport" && story.standfirst && (
-              // The article's standfirst/deck — the one-line summary
-              // between headline and body on the original page. Styled
-              // distinctly (lighter weight, italic, muted color) so it
-              // reads as a subheading, not as the first line of body text.
-              <div
-                style={{
-                  fontFamily: "'Lora', serif",
-                  fontSize: 15.5,
-                  fontWeight: 600,
-                  fontStyle: "italic",
-                  color: "#5c665f",
-                  lineHeight: 1.55,
-                  marginTop: 8,
-                }}
-              >
-                <ClickableText
-                  as="span"
-                  content={story.standfirst}
-                  source="story-standfirst"
-                  savedWordsLower={savedWordsLower}
-                  onWordClick={onWordClick}
-                  phraseAnchor={phraseAnchor}
-                />
-              </div>
-            )}
           </div>
         )}
         {(imageAbove || paginated) && pageIndex === 0 && (
-          <ChapterImage seed={`${story.id}-${chapterIndex}`} color={category.color} motif={category.artMotif} chapter={chapter} />
+          <ChapterImage seed={`${story.id}-${chapterIndex}`} color={category.color} motif={category.artMotif} chapter={chapter} onRetry={onRetryChapterImage ? () => onRetryChapterImage(story.id, chapterIndex) : null} />
         )}
         <div
           ref={textContainerRef}
@@ -15827,7 +16270,7 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
                 dropCap
                 dropCapColor={dropCapColor}
               />
-              <ChapterImage seed={`${story.id}-${chapterIndex}`} color={category.color} motif={category.artMotif} chapter={chapter} />
+              <ChapterImage seed={`${story.id}-${chapterIndex}`} color={category.color} motif={category.artMotif} chapter={chapter} onRetry={onRetryChapterImage ? () => onRetryChapterImage(story.id, chapterIndex) : null} />
               {secondHalf && (
                 <ClickableText
                   content={secondHalf}
@@ -17464,10 +17907,15 @@ function timeAgoLabel(ts) {
 // Creation date only — never a "last modified"/"last read"/"last synced"
 // date. Used under every book/story listing (personal library and the
 // public catalog alike), no exceptions. Returns null (render nothing) when
-// there's no timestamp to show, rather than printing a bogus date.
+// there's no timestamp to show, rather than printing a bogus date. Includes
+// hour:minute (not just the date) so two books uploaded on the same day are
+// still distinguishable from one another.
 function createdDateLabel(ts) {
   if (!ts) return null;
-  return `נוצר ב-${new Date(ts).toLocaleDateString("he", { year: "numeric", month: "long", day: "numeric" })}`;
+  const d = new Date(ts);
+  const datePart = d.toLocaleDateString("he", { year: "numeric", month: "long", day: "numeric" });
+  const timePart = d.toLocaleTimeString("he", { hour: "2-digit", minute: "2-digit" });
+  return `נוצר ב-${datePart}, ${timePart}`;
 }
 
 // For a book that came from the public catalog (story.fromPublicLibrary),
