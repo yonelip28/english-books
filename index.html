@@ -1119,6 +1119,73 @@ async function withAutoRetry(task, { attempts = 3, onRetrying } = {}) {
 // built-in procedural sketch illustration instead (never a hard failure).
 // ---------------------------------------------------------------------------
 
+// Shrinks an embedded data: URL image down to a sane on-screen size before
+// it ever reaches app state — every KB saved here is a KB never gzip'd,
+// base64'd again, and re-uploaded on every future cloud backup. Extremely
+// conservative by design, since this touches images the reader actually
+// looks at (AI illustrations, article photos):
+//   - Anything that ISN'T a data: URL (e.g. a plain hosted https:// URL, as
+//     OpenAI sometimes returns) is left completely untouched — nothing to
+//     shrink locally, and no point risking a fetch of it.
+//   - Animated GIFs are left completely untouched — re-encoding would
+//     collapse them to a single frame.
+//   - A PNG is only ever re-encoded as PNG (never JPEG) unless every
+//     sampled pixel is fully opaque — this keeps transparency intact for
+//     any image that actually uses it (e.g. a logo), at the cost of a
+//     smaller saving on those specific images.
+//   - If anything goes wrong, or the "shrunk" result isn't actually
+//     smaller, the ORIGINAL image is returned unchanged. This can only
+//     ever make an image smaller than it already was, never different in
+//     a way the reader would notice, and never missing.
+async function shrinkImageDataUrl(dataUrl, maxW = 900, quality = 0.72) {
+  try {
+    if (typeof dataUrl !== "string" || !/^data:image\//i.test(dataUrl)) return dataUrl; // not a local data URL — nothing to do
+    if (/^data:image\/gif/i.test(dataUrl)) return dataUrl; // never touch animated GIFs
+    const approxBytes = (dataUrl.length * 3) / 4;
+    if (approxBytes < 40 * 1024) return dataUrl; // already tiny — not worth any risk of quality loss
+
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("image decode failed"));
+      el.src = dataUrl;
+    });
+    if (!img.naturalWidth || !img.naturalHeight) return dataUrl;
+
+    const scale = Math.min(1, maxW / img.naturalWidth);
+    const outW = Math.max(1, Math.round(img.naturalWidth * scale));
+    const outH = Math.max(1, Math.round(img.naturalHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0, outW, outH);
+
+    const isPng = /^data:image\/png/i.test(dataUrl);
+    let hasTransparency = false;
+    if (isPng) {
+      // Cheap opacity check: sample a grid of pixels rather than every
+      // one — plenty to catch a transparent logo/graphic without the
+      // cost of scanning the whole image.
+      const step = Math.max(1, Math.floor(Math.min(outW, outH) / 24));
+      const { data: px } = ctx.getImageData(0, 0, outW, outH);
+      outer: for (let y = 0; y < outH; y += step) {
+        for (let x = 0; x < outW; x += step) {
+          if (px[(y * outW + x) * 4 + 3] < 255) {
+            hasTransparency = true;
+            break outer;
+          }
+        }
+      }
+    }
+
+    const out = isPng && hasTransparency ? canvas.toDataURL("image/png") : canvas.toDataURL("image/jpeg", quality);
+    return out.length < dataUrl.length ? out : dataUrl; // never keep a "shrunk" version that's actually bigger
+  } catch (e) {
+    return dataUrl; // any failure at all — just keep the original, exactly as before this existed
+  }
+}
+
 async function generateImageOpenAI(prompt, apiKey, modelOverride) {
   const model = modelOverride || getImageModel("openai") || IMAGE_MODEL_DEFAULTS.openai;
   const response = await fetchWithTimeout("https://api.openai.com/v1/images/generations", {
@@ -1132,8 +1199,8 @@ async function generateImageOpenAI(prompt, apiKey, modelOverride) {
   if (!response.ok) throw await httpError(response);
   const data = await response.json();
   const item = data?.data?.[0];
-  if (item?.url) return item.url;
-  if (item?.b64_json) return `data:image/png;base64,${item.b64_json}`;
+  if (item?.url) return item.url; // a hosted URL, not embedded — nothing to shrink
+  if (item?.b64_json) return await shrinkImageDataUrl(`data:image/png;base64,${item.b64_json}`);
   return null;
 }
 
@@ -1153,7 +1220,7 @@ async function generateImageGoogle(prompt, apiKey, modelOverride) {
   const parts = data?.candidates?.[0]?.content?.parts || [];
   const imgPart = parts.find((p) => p.inlineData && p.inlineData.data);
   if (!imgPart) return null;
-  return `data:${imgPart.inlineData.mimeType || "image/png"};base64,${imgPart.inlineData.data}`;
+  return await shrinkImageDataUrl(`data:${imgPart.inlineData.mimeType || "image/png"};base64,${imgPart.inlineData.data}`);
 }
 
 // A model name in the request is unrecognized by the API right now (image
@@ -4583,13 +4650,18 @@ async function extractPdfText(file, onProgress) {
 
 async function renderPdfPageToImage(pdf, pageNum) {
   const page = await pdf.getPage(pageNum);
-  const viewport = page.getViewport({ scale: 1.4 });
+  // Scale/quality kept modest on purpose: this is only ever shown as an
+  // optional fallback "original cover" page (see extractPdfText above), not
+  // used for reading text, so it doesn't need to be full-resolution — and
+  // every extra KB here gets stored twice per book (front + back) and
+  // shipped in every cloud backup.
+  const viewport = page.getViewport({ scale: 1.1 });
   const canvas = document.createElement("canvas");
   canvas.width = viewport.width;
   canvas.height = viewport.height;
   const ctx = canvas.getContext("2d");
   await page.render({ canvasContext: ctx, viewport }).promise;
-  return canvas.toDataURL("image/jpeg", 0.85);
+  return canvas.toDataURL("image/jpeg", 0.6);
 }
 
 function applyPdfMatrix(m, x, y) {
@@ -4703,14 +4775,19 @@ async function extractPageEmbeddedImages(page, rawViewport) {
     const dedupeKey = `${Math.round(sx / 8)}:${Math.round(sy / 8)}:${Math.round(sw / 8)}:${Math.round(sh / 8)}`;
     if (seen.has(dedupeKey)) return;
     seen.add(dedupeKey);
-    const maxW = 900; // cap stored size — these get embedded as data URLs in IndexedDB
+    const maxW = 650; // cap stored size — these get embedded as data URLs in IndexedDB
+    // and, from there, gzip-compressed into every cloud backup. JPEG is
+    // already a compressed format, so gzip barely shrinks it further —
+    // the real saving has to come from a smaller/lower-quality source
+    // image here, not from compression downstream. 650px/0.6 is still
+    // plenty sharp for an in-chapter illustration read on a phone screen.
     const outW = Math.min(maxW, Math.round(sw));
     const outH = Math.max(1, Math.round(sh * (outW / sw)));
     const out = document.createElement("canvas");
     out.width = outW;
     out.height = outH;
     out.getContext("2d").drawImage(canvas, sx, sy, sw, sh, 0, 0, outW, outH);
-    images.push({ y: (r.y0 + r.y1) / 2, dataUrl: out.toDataURL("image/jpeg", 0.82) });
+    images.push({ y: (r.y0 + r.y1) / 2, dataUrl: out.toDataURL("image/jpeg", 0.6) });
   });
   return images;
 }
@@ -5490,6 +5567,11 @@ async function resolveArticleImages(images, onProgress) {
             reader.onerror = () => reject(new Error("image read failed"));
             reader.readAsDataURL(blob);
           });
+          // Web photos come through at whatever size the source site used —
+          // often far larger than needed for in-app reading width. Same
+          // safe shrink as AI illustrations: never touches GIFs, never
+          // strips real transparency, never returns something bigger.
+          dataUrl = await shrinkImageDataUrl(dataUrl);
         }
       }
     } catch (e) {
