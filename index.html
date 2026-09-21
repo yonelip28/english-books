@@ -1,3 +1,17 @@
+<!--
+  ספריית אנגלית — חדר קריאה
+  © 2026 Yonatan Eliyahu Lifshitz. All rights reserved. / © 2026 יונתן אליהו ליפשיץ. כל הזכויות שמורות.
+
+  This file (and every file in this project) is provided "AS-IS" for personal
+  use only. No part of the source code, design, graphics, or text may be
+  reproduced, distributed, transmitted, published, or otherwise used for any
+  commercial or other purpose without the prior written permission of the
+  copyright owner.
+
+  אין להעתיק, לשכפל, להפיץ, לשדר, לפרסם, למכור או לעשות כל שימוש מסחרי או אחר
+  בקוד המקור, בעיצוב, בגרפיקה, בטקסטים או בכל חלק אחר של אפליקציה זו, ללא
+  אישור מראש ובכתב מאת בעל הזכויות.
+-->
 <!doctype html>
 <html lang="he" dir="rtl">
 <head>
@@ -50,6 +64,11 @@
        PDFs just pass through close to their original size, no data lost
        either way. -->
   <script src="https://unpkg.com/pako@2.1.0/dist/pako.min.js"></script>
+  <!-- OCR engine used only by the camera-scan import feature (reading text
+       out of a photographed book page). Like pdf.js above, this runs
+       entirely inside the browser — a scanned photo is never uploaded
+       anywhere to be read; the text recognition happens locally on-device. -->
+  <script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
   <!-- Firebase Authentication (Google sign-in) — only used in Firebase
        backup mode, so a reader who has entered their own project's details
        can sign in with Google instead of typing an email, and so Firestore
@@ -59,6 +78,56 @@
 </head>
 <body>
   <div id="root"><div id="boot"><div class="ring"></div><div>טוען את חדר קריאה…</div></div></div>
+
+  <!-- ===== Domain lock =====
+       Runs before anything else loads. If this copy of the page is being
+       served from a domain that isn't ours, it blanks the page with a
+       clear message and sets window.__APP_DOMAIN_LOCKED__ = true, which
+       the app checks again right before it renders (see the
+       ReactDOM.createRoot(...).render(...) call near the bottom of this
+       file) so a copied index.html can't be brought back to life by
+       deleting just this block.
+       Update ALLOWED_DOMAINS below once the final custom domain (if any)
+       is known — for now, any "*.netlify.app" subdomain is allowed so the
+       app keeps working across Netlify preview/branch deploys. -->
+  <script>
+    (function () {
+      var ALLOWED_DOMAINS = [
+        // Exact-match hostnames:
+        "localhost",
+        "127.0.0.1",
+        // Add the final custom domain here once it's registered, e.g.:
+        // "reading-room.co.il",
+      ];
+      var ALLOWED_SUFFIXES = [
+        ".netlify.app", // covers every Netlify subdomain (prod + deploy previews)
+      ];
+
+      var host = (window.location.hostname || "").toLowerCase();
+      var isLocalFile = window.location.protocol === "file:"; // opening the .html directly, useful for local dev/testing
+      var isAllowed =
+        isLocalFile ||
+        ALLOWED_DOMAINS.indexOf(host) !== -1 ||
+        ALLOWED_SUFFIXES.some(function (suffix) {
+          return host.slice(-suffix.length) === suffix;
+        });
+
+      if (!isAllowed) {
+        window.__APP_DOMAIN_LOCKED__ = true;
+        document.getElementById("root").innerHTML =
+          '<div style="height:100%;display:flex;align-items:center;justify-content:center;' +
+          'flex-direction:column;gap:12px;padding:24px;text-align:center;' +
+          'font-family:sans-serif;color:#23342E;background:#ECEEE6;">' +
+          '<div style="font-size:17px;font-weight:700;">' +
+          "האפליקציה הזו מורשית להפעלה רק בדומיין הרשמי." +
+          "</div>" +
+          '<div style="font-size:14px;color:#5c665f;max-width:420px;">' +
+          "This application is licensed to run only on its official domain." +
+          "</div>" +
+          "</div>";
+      }
+    })();
+  </script>
 
   <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
@@ -1381,6 +1450,28 @@ function providerSupportsImages(provider = getEffectiveImageProvider()) {
 //     point the reader is reassigned to the next least-loaded project.
 //   - A restore always looks the reader up by their own identity, so it
 //     finds their data no matter which pooled project it ended up in.
+// ⚠️ SECURITY REQUIREMENT — Firestore rules, not this file, are what
+// actually protects readers' data:
+// The apiKey values below are Firebase WEB API keys, which are meant to be
+// public (they only identify the project to Firebase's client SDK — they
+// are NOT secrets and are not a substitute for access control). The
+// per-reader data itself is protected entirely by each project's Firestore
+// Security Rules, which is why EVERY one of these projects (registry +
+// every pooled project) MUST have rules that require a valid, signed-in
+// Firebase Auth user for any read or write of personal data, e.g.:
+//
+//   rules_version = '2';
+//   service cloud.firestore {
+//     match /databases/{database}/documents {
+//       match /{document=**} {
+//         allow read, write: if request.auth != null;
+//       }
+//     }
+//   }
+// (Tighten further per-collection if needed — e.g. allow write only when
+// request.auth.uid == resource.data.ownerId — but request.auth != null is
+// the minimum: without it, anyone who copies this front-end code to another
+// domain could still read/write data directly against these projects.)
 const CLOUD_BACKEND_CONFIGS = [
   {
     projectId: "english-books-6a03a", // e.g. "my-reading-app-12345"
@@ -1437,6 +1528,10 @@ const CLOUD_EMAIL_KEY = "reader-cloud-email";
 const CLOUD_AUTOSYNC_KEY = "reader-cloud-autosync";
 const CLOUD_LAST_SYNC_KEY = "reader-cloud-last-sync";
 const ONBOARDED_KEY = "reader-onboarded-v1";
+// Separate from ONBOARDED_KEY (which gates the one-time backup/email setup
+// prompt): this gates the app-tour intro slides shown before the home
+// screen the very first time the app runs on a given browser profile.
+const APP_TOUR_KEY = "reader-app-tour-v1";
 const BACKUP_COLLECTION = "reader_backups";
 const NETLIFY_FUNCTION_URL = "/.netlify/functions/backup";
 // Server-side fetch proxy used by importArticleFromUrl to get around sites
@@ -2686,6 +2781,12 @@ function storyIsPublic(story) {
   // ignores story.isPublic entirely, since the whole point is that this
   // can't be flipped by a bug, a future feature, or a stray flag.
   if (story.categoryId === "webImport") return false;
+  // Camera-scanned books are the same way — always private, no exception,
+  // for the same reason (see SCAN_IMPORT_CATEGORY's own comment above).
+  if (story.categoryId === "scanImport") return false;
+  // A single scanned/translated text snippet is the same way, for the same
+  // reason (see SCAN_TEXT_CATEGORY's own comment above).
+  if (story.categoryId === "scanText") return false;
   if (story.categoryId === "search" || story.categoryId === "pdfImport") {
     return story.isPublic !== false; // default true unless explicitly marked private
   }
@@ -3606,6 +3707,45 @@ const ARTICLE_IMPORT_CATEGORY = {
 };
 CAT_BY_ID.webImport = ARTICLE_IMPORT_CATEGORY;
 
+// Books created from camera-scanned pages get their own virtual "category"
+// too — same idea as PDF_IMPORT_CATEGORY / ARTICLE_IMPORT_CATEGORY. Like a
+// web-imported article, a scanned book is ALWAYS private (see the hardcoded
+// categoryId check in storyIsPublic() below) since the photographed text
+// belongs to whichever printed book/page it was copied from, not to this
+// reader — but UNLIKE a web-imported article, printing is allowed (the
+// reader photographed their own physical copy, so a personal-use printout
+// of their own transcription is fine — see printStory, which only blocks
+// categoryId "webImport").
+const SCAN_IMPORT_CATEGORY = {
+  id: "scanImport",
+  name: "ספר מסריקה",
+  tagline: "ספרים שיובאו מסריקת מצלמה",
+  topicPrompt: "",
+  icon: "Camera",
+  color: "#6B5B95",
+  artMotif: "society",
+};
+CAT_BY_ID.scanImport = SCAN_IMPORT_CATEGORY;
+
+// A single continuous piece of text scanned from the camera — for reading
+// or translating a hand-picked bit of English (a worksheet, a sign, a
+// paragraph) rather than "typing in" a whole book. Multiple photos can be
+// taken, but they're stitched into ONE continuous text — no chapter
+// grouping, no book structure — same idea as ARTICLE_IMPORT_CATEGORY but
+// sourced from the camera instead of a pasted link. Always private, like
+// every other import category above; printing IS allowed (see printStory,
+// which only ever blocks categoryId "webImport").
+const SCAN_TEXT_CATEGORY = {
+  id: "scanText",
+  name: "טקסט מצולם",
+  tagline: "קטעי טקסט שצולמו וזוהו מהמצלמה",
+  topicPrompt: "",
+  icon: "Camera",
+  color: "#B0793E",
+  artMotif: "society",
+};
+CAT_BY_ID.scanText = SCAN_TEXT_CATEGORY;
+
 // Pseudo-category for words added directly through the Dictionary (not tied
 // to any story) — same purpose as SEARCH_CATEGORY above: display only.
 const DICTIONARY_CATEGORY = {
@@ -3900,6 +4040,13 @@ function AppIcon({ name, size = 16, color, className = "" }) {
         <svg {...common}>
           <path d="M22.61 16.95A5 5 0 0 0 18 10h-1.26a8 8 0 0 0-7.05-6M5 5a8 8 0 0 0 4 15h9a5 5 0 0 0 1.7-.3" />
           <line x1="1" y1="1" x2="23" y2="23" />
+        </svg>
+      );
+    case "Camera":
+      return (
+        <svg {...common}>
+          <path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h2.1l1-1.6A1.5 1.5 0 0 1 9.9 4.6h4.2a1.5 1.5 0 0 1 1.3.75l1 1.65h2.1A1.5 1.5 0 0 1 20 8.5v9A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5z" />
+          <circle cx="12" cy="13" r="3.5" />
         </svg>
       );
     default:
@@ -4274,6 +4421,451 @@ function estimateChapterSeconds(wordsPerChapter) {
 
 function countWords(text) {
   return (text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+// Tidies raw Tesseract OCR output for one scanned page into readable prose.
+// Tesseract emits one line of text per detected line of print, which is NOT
+// the same as one line per paragraph — a normal justified paragraph comes
+// back as several short lines in a row. So: a single line break (inside a
+// paragraph) becomes a space, while a blank line (an actual paragraph break
+// in the source) is kept as one. Stray OCR noise (isolated page-number-only
+// lines, repeated spaces) is cleaned up too. This intentionally does NOT
+// try to fix misread words — the point of a scan import is the exact text
+// as printed, same as a PDF import never rewrites what it extracts.
+function cleanOcrText(rawText) {
+  const text = (rawText || "").replace(/\r\n?/g, "\n");
+  const paragraphs = text
+    .split(/\n\s*\n/) // blank line = paragraph break
+    .map((block) =>
+      block
+        .split("\n")
+        .map((line) => line.trim())
+        // A lone line that's just a page number (all digits, or a couple of
+        // digits with dashes/dots) is almost always a header/footer the OCR
+        // picked up, not real book content.
+        .filter((line) => line && !/^[\d\s.\-–—]{1,6}$/.test(line))
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .replace(/([a-z])-\s+([a-z])/g, "$1$2") // rejoin a word hyphenated across a line break
+        .trim()
+    )
+    .filter(Boolean);
+  return paragraphs.join("\n\n");
+}
+
+// ===== On-device page-layout analysis for scanned pages =====
+// Tesseract hands back every recognized word with its bounding box. Instead
+// of trusting its flat text (which reads straight across a two-column page
+// as if it were one wide line), the scan importers rebuild the reading order
+// and the page structure from those boxes — the same idea as reading a PDF
+// by layout rather than by raw stream order. It recognizes:
+//   • multiple text columns (and sidebars), read column by column, with
+//     full-width titles/footers kept in place around them;
+//   • headings (larger type, ALL-CAPS lines, short title-like lines);
+//   • bulleted / numbered lists (each item its own line, wrapped items kept whole);
+//   • tables and aligned rows (kept row by row, cells separated by " | ");
+//   • paragraphs (line-wrap vs. real paragraph break, indents, hyphenation);
+//   • verse (short lines that each start with a capital keep their line breaks);
+//   • a sentence that continues from one column / page to the next;
+//   • page numbers (dropped).
+// Everything here runs locally in the browser — nothing is uploaded.
+const SCAN_TERMINAL_RE = /[.!?…:;"”’')\]]$/;
+const SCAN_BULLET_STRONG = /^[•·●○▪◦‣]$/;
+const SCAN_BULLET_WEAK = /^([*+\-–—«»¢®©°@]|[eo])$/; // common OCR misreads of a bullet, or dialogue dashes
+const SCAN_PAGE_NUMBER_RE = /^(page\s+)?[\d\s.\-–—|\/]{1,10}$/i;
+
+function scanMedian(arr) {
+  if (!arr.length) return 0;
+  const s = arr.slice().sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function scanQuantile(arr, q) {
+  if (!arr.length) return 0;
+  const s = arr.slice().sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.max(0, Math.floor(q * (s.length - 1))))];
+}
+
+function scanWordFromTess(w) {
+  if (!w || !w.bbox) return null;
+  const t = String(w.text || "").trim();
+  if (!t) return null;
+  const b = w.bbox;
+  if (!(b.x1 > b.x0 && b.y1 > b.y0)) return null;
+  const conf = typeof w.confidence === "number" ? w.confidence : 100;
+  if (conf < 15) return null;
+  // Stray marks (page borders, table rules, specks) read as symbols — drop
+  // them unless they look like a real bullet.
+  if (/^[^A-Za-z0-9]+$/.test(t) && conf < 60 && !SCAN_BULLET_STRONG.test(t) && !SCAN_BULLET_WEAK.test(t)) return null;
+  return { t, x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 };
+}
+
+// Tesseract's own line objects (skew-aware) are the starting point; if the
+// build in use doesn't expose them, words are grouped into lines by height.
+function scanCollectLines(data) {
+  const lines = [];
+  const fromLine = (l) => (l && l.words ? l.words.map(scanWordFromTess).filter(Boolean) : []);
+  if (data && Array.isArray(data.blocks) && data.blocks.length) {
+    data.blocks.forEach((b) => (b.paragraphs || []).forEach((p) => (p.lines || []).forEach((l) => { const ws = fromLine(l); if (ws.length) lines.push(ws); })));
+  }
+  if (!lines.length && data && Array.isArray(data.lines)) {
+    data.lines.forEach((l) => { const ws = fromLine(l); if (ws.length) lines.push(ws); });
+  }
+  if (!lines.length && data && Array.isArray(data.words)) {
+    const words = data.words.map(scanWordFromTess).filter(Boolean).sort((a, b) => (a.y0 + a.y1) - (b.y0 + b.y1));
+    const medH = scanMedian(words.map((w) => w.y1 - w.y0)) || 10;
+    let cur = null;
+    words.forEach((w) => {
+      const cy = (w.y0 + w.y1) / 2;
+      if (cur && Math.abs(cy - cur.cy) <= 0.5 * medH) { cur.ws.push(w); cur.cy = (cur.cy * (cur.ws.length - 1) + cy) / cur.ws.length; }
+      else { if (cur) lines.push(cur.ws); cur = { ws: [w], cy }; }
+    });
+    if (cur) lines.push(cur.ws);
+  }
+  return lines;
+}
+
+function scanMakePiece(words) {
+  const x0 = Math.min(...words.map((w) => w.x0));
+  const x1 = Math.max(...words.map((w) => w.x1));
+  const y0 = Math.min(...words.map((w) => w.y0));
+  const y1 = Math.max(...words.map((w) => w.y1));
+  return { words, x0, x1, y0, y1, cy: (y0 + y1) / 2, h: scanMedian(words.map((w) => w.y1 - w.y0)), text: words.map((w) => w.t).join(" ") };
+}
+
+// A gutter = a vertical strip of white space, wide enough, that (almost) no
+// text crosses — running through the region. Returns null unless both sides
+// look like real flowing columns (a table's aligned cells, or a list's
+// number column, are deliberately NOT cut here — see scanRegionBlocks).
+function scanFindGutter(pieces, ctx) {
+  const H = ctx.H;
+  let xmin = Infinity, xmax = -Infinity;
+  pieces.forEach((p) => { xmin = Math.min(xmin, p.x0); xmax = Math.max(xmax, p.x1); });
+  const W = xmax - xmin;
+  if (W < 10 * H) return null;
+  const bin = Math.max(2, H / 4);
+  const nb = Math.ceil(W / bin) + 1;
+  const diff = new Array(nb + 1).fill(0);
+  pieces.forEach((p) => {
+    const a = Math.max(0, Math.floor((p.x0 - xmin) / bin));
+    const b = Math.min(nb - 1, Math.floor((p.x1 - xmin) / bin));
+    diff[a]++; diff[b + 1]--;
+  });
+  const cov = [];
+  let run = 0;
+  for (let i = 0; i < nb; i++) { run += diff[i]; cov.push(run); }
+  // A few full-width lines (title, footer, page number) may cross the strip.
+  const tol = Math.max(2, Math.floor(0.12 * pieces.length));
+  const minW = Math.max(1.4 * H, 0.025 * W);
+  const lo = xmin + 0.08 * W, hi = xmax - 0.08 * W;
+  let best = null;
+  for (let i = 0; i < nb;) {
+    if (cov[i] <= tol) {
+      let j = i;
+      while (j + 1 < nb && cov[j + 1] <= tol) j++;
+      const x0 = xmin + i * bin, x1 = xmin + (j + 1) * bin;
+      if (x0 >= lo && x1 <= hi && x1 - x0 >= minW && (!best || x1 - x0 > best.x1 - best.x0)) best = { x0, x1 };
+      i = j + 1;
+    } else i++;
+  }
+  if (!best) return null;
+  // The tolerance lets a couple of lines poke into the strip, so pin the
+  // real gutter down from the pieces that clearly belong to a side.
+  const rough = (best.x0 + best.x1) / 2;
+  const contains = (p, x) => p.x0 < x && p.x1 > x;
+  const side = pieces.filter((p) => !contains(p, rough));
+  const L = side.filter((p) => (p.x0 + p.x1) / 2 < rough);
+  const R = side.filter((p) => (p.x0 + p.x1) / 2 >= rough);
+  if (L.length < 3 || R.length < 3) return null;
+  const lEdge = Math.max(...L.map((p) => p.x1));
+  const rEdge = Math.min(...R.map((p) => p.x0));
+  if (rEdge - lEdge < minW) return null;
+  best = { x0: lEdge, x1: rEdge, cx: (lEdge + rEdge) / 2 };
+  const avgWords = (arr) => arr.reduce((n, p) => n + p.words.length, 0) / arr.length;
+  const aL = avgWords(L), aR = avgWords(R);
+  if (aL >= 4 && aR >= 4) return best; // two flowing text columns
+  const aligned = L.filter((p) => R.some((q) => Math.abs(q.cy - p.cy) <= 0.5 * H)).length / L.length;
+  if (aligned >= 0.7) return null; // aligned short cells → a table / number column, handled per-row
+  if (aL >= 2 && aR >= 2) return best; // short, unaligned side text → a sidebar / box
+  return null;
+}
+
+// Recursive column split → regions in reading order. Lines that cross the
+// gutter (title, footer, a full-width paragraph) become full-width zones
+// between the column zones, so "title → left column → right column → footer"
+// comes out in the right order, and nested columns (3+) fall out naturally.
+function scanOrderRegions(pieces, ctx, depth) {
+  if (depth > 3 || pieces.length < 6) return [pieces];
+  const g = scanFindGutter(pieces, ctx);
+  if (!g) return [pieces];
+  const gcx = g.cx;
+  const pad = 0.4 * ctx.H;
+  const crossing = pieces.filter((p) => p.x0 < gcx && p.x1 > gcx).sort((a, b) => a.y0 - b.y0);
+  const bands = [];
+  crossing.forEach((p) => {
+    const b = bands[bands.length - 1];
+    if (b && p.y0 - pad <= b.y1) b.y1 = Math.max(b.y1, p.y1 + pad);
+    else bands.push({ y0: p.y0 - pad, y1: p.y1 + pad });
+  });
+  const colZones = Array.from({ length: bands.length + 1 }, () => []);
+  const bandZones = bands.map(() => []);
+  pieces.forEach((p) => {
+    const k = bands.findIndex((b) => p.cy >= b.y0 && p.cy <= b.y1);
+    if (k >= 0) bandZones[k].push(p);
+    else {
+      let c = 0;
+      while (c < bands.length && bands[c].y1 < p.cy) c++;
+      colZones[c].push(p);
+    }
+  });
+  const out = [];
+  for (let i = 0; i <= bands.length; i++) {
+    const cz = colZones[i];
+    if (cz.length) {
+      const L = cz.filter((p) => (p.x0 + p.x1) / 2 < gcx);
+      const R = cz.filter((p) => (p.x0 + p.x1) / 2 >= gcx);
+      if (L.length) out.push(...scanOrderRegions(L, ctx, depth + 1));
+      if (R.length) out.push(...scanOrderRegions(R, ctx, depth + 1));
+    }
+    if (i < bands.length && bandZones[i].length) out.push(bandZones[i]);
+  }
+  return out;
+}
+
+function scanJoinLines(texts) {
+  let out = "";
+  texts.forEach((t, i) => {
+    if (!i) { out = t; return; }
+    if (/[A-Za-z]-$/.test(out) && /^[a-z]/.test(t)) out = out.slice(0, -1) + t; // word hyphenated across a line break
+    else out += " " + t;
+  });
+  return out.replace(/\s+/g, " ").trim();
+}
+
+function scanRegionBlocks(pieces, ctx) {
+  const H = ctx.H;
+  // 1) group pieces into rows (pieces side by side on one baseline = cells)
+  const sorted = pieces.slice().sort((a, b) => a.cy - b.cy || a.x0 - b.x0);
+  const rows = [];
+  sorted.forEach((p) => {
+    let r = null;
+    for (let i = rows.length - 1; i >= 0 && i >= rows.length - 3; i--) {
+      if (Math.abs(rows[i].cy - p.cy) <= 0.5 * Math.max(H, p.h)) { r = rows[i]; break; }
+    }
+    if (r) { r.pieces.push(p); r.cy = (r.cy * (r.pieces.length - 1) + p.cy) / r.pieces.length; }
+    else rows.push({ pieces: [p], cy: p.cy });
+  });
+  const LONE_MARKER = /^(\d{1,3}[.)]?|[•·●○▪◦‣]|\(?[a-z]\)|[ivx]+\))$/i;
+  rows.forEach((r) => r.pieces.sort((a, b) => a.x0 - b.x0));
+  // A row that is just "marker | text" is a list item whose number/bullet
+  // happens to sit far from its text — not a two-column table.
+  const markerRows = rows.filter((r) => r.pieces.length === 2 && LONE_MARKER.test(r.pieces[0].text));
+  if (markerRows.length >= 2) {
+    markerRows.forEach((r) => {
+      const words = r.pieces[0].words.map((w) => ({ ...w })).concat(r.pieces[1].words);
+      if (/^\d{1,3}$/.test(words[0].t)) words[0].t += ".";
+      r.pieces = [scanMakePiece(words)];
+    });
+  }
+  rows.forEach((r) => {
+    r.x0 = Math.min(...r.pieces.map((p) => p.x0));
+    r.x1 = Math.max(...r.pieces.map((p) => p.x1));
+    r.y0 = Math.min(...r.pieces.map((p) => p.y0));
+    r.y1 = Math.max(...r.pieces.map((p) => p.y1));
+    r.h = scanMedian(r.pieces.map((p) => p.h));
+    r.text = r.pieces.map((p) => p.text).join(" ");
+  });
+  rows.sort((a, b) => a.cy - b.cy);
+
+  // 2) tables: runs of rows made of ≥2 cells whose 2nd cell lines up
+  const isTable = new Array(rows.length).fill(false);
+  for (let i = 0; i < rows.length;) {
+    if (rows[i].pieces.length >= 2) {
+      let j = i;
+      while (j + 1 < rows.length && rows[j + 1].pieces.length >= 2) j++;
+      if (j - i + 1 >= 2) {
+        const xs = rows.slice(i, j + 1).map((r) => r.pieces[1].x0);
+        const med = scanMedian(xs);
+        const ok = xs.filter((x) => Math.abs(x - med) <= 1.5 * H).length / xs.length;
+        if (ok >= 0.7) for (let k = i; k <= j; k++) isTable[k] = true;
+      }
+      i = j + 1;
+    } else i++;
+  }
+  // a lone row of separated pieces that isn't a table is just one line of text
+  rows.forEach((r, i) => { if (!isTable[i]) r.text = scanJoinLines(r.pieces.map((p) => p.text)); });
+
+  // 3) stats for the region's own text rows
+  const textRows = rows.filter((_, i) => !isTable[i]);
+  const lm = scanQuantile(textRows.map((r) => r.x0), 0.2);
+  const re = scanQuantile(textRows.map((r) => r.x1), 0.9);
+  const gaps = [];
+  for (let i = 1; i < textRows.length; i++) { const g = textRows[i].y0 - textRows[i - 1].y1; if (g > -H) gaps.push(Math.max(0, g)); }
+  const medGap = gaps.length >= 3 ? scanMedian(gaps) : 0.35 * H;
+  const lettersOf = (s) => s.replace(/[^A-Za-z]/g, "");
+
+  const markerCount = {};
+  const markerOf = (r) => {
+    const w0 = r.pieces[0].words[0];
+    const w1 = r.pieces[0].words[1];
+    if (!w0) return null;
+    const first = w0.t;
+    if (w1 && (SCAN_BULLET_STRONG.test(first) || SCAN_BULLET_WEAK.test(first)) && w1.x0 - w0.x1 >= 0.45 * H) {
+      return { kind: "bullet", token: first, strong: SCAN_BULLET_STRONG.test(first), textStart: w1.x0 };
+    }
+    const m = r.text.match(/^(\d{1,3}[.)]|\(?[a-z]\)|\([ivx]+\))\s+\S/i);
+    if (m) return { kind: "num", token: m[1], strong: false, textStart: r.x0 };
+    return null;
+  };
+  textRows.forEach((r) => {
+    r.marker = markerOf(r);
+    if (r.marker) { const k = r.marker.kind === "num" ? "num" : r.marker.token; markerCount[k] = (markerCount[k] || 0) + 1; }
+  });
+  textRows.forEach((r) => {
+    if (!r.marker) return;
+    const k = r.marker.kind === "num" ? "num" : r.marker.token;
+    const okNum = r.marker.kind === "num" && (markerCount.num >= 2 || /^1[.)]$/.test(r.marker.token));
+    if (!(r.marker.strong || okNum || markerCount[k] >= 2)) r.marker = null;
+  });
+
+  const nWordsOf = (r) => r.text.split(/\s+/).filter(Boolean).length;
+  const gapBefore = (i) => (i === 0 ? Infinity : textRows[i].y0 - textRows[i - 1].y1);
+  const gapAfter = (i) => (i === textRows.length - 1 ? Infinity : textRows[i + 1].y0 - textRows[i].y1);
+  const isHeading = (r, i) => {
+    if (r.marker) return false;
+    const n = nWordsOf(r);
+    const letters = lettersOf(r.text);
+    if (r.h >= 1.28 * H && n <= 16) return true;
+    if (letters.length >= 3 && n <= 10 && letters.replace(/[^A-Z]/g, "").length / letters.length >= 0.85 && !/[,;]$/.test(r.text)) return true;
+    const words = r.text.split(/\s+/).filter((w) => w.length > 3);
+    const capRatio = words.length ? words.filter((w) => /^[A-Z]/.test(w)).length / words.length : 0;
+    const roomy = gapBefore(i) >= 1.3 * medGap + 0.3 * H && gapAfter(i) >= 1.3 * medGap + 0.3 * H;
+    if (n <= 8 && /^[A-Z0-9"“‘]/.test(r.text) && !/[.,;:]$/.test(r.text) && capRatio >= 0.7 && (roomy || textRows.length <= 2)) return true;
+    return false;
+  };
+  const isParaBreak = (prev, r) => {
+    const gap = r.y0 - prev.y1;
+    if (gap > Math.max(medGap * 1.8, medGap + 0.55 * H)) return true;
+    if (r.x0 - lm >= 1.0 * H && prev.x0 - lm < 0.6 * H) return true; // first-line indent
+    if (prev.x1 < re - 3.5 * H && SCAN_TERMINAL_RE.test(prev.text) && /^[A-Z"“‘'(\[]/.test(r.text)) return true; // short last line of a paragraph
+    return false;
+  };
+
+  // 4) walk rows in order → blocks
+  const blocks = [];
+  let cur = null;
+  const flush = () => {
+    if (!cur) return;
+    if (cur.type === "h") blocks.push({ type: "h", text: scanJoinLines(cur.rows.map((r) => r.text)) });
+    else if (cur.type === "li") {
+      const body = scanJoinLines(cur.rows.map((r, idx) => (idx === 0 && cur.marker.kind === "bullet" ? r.pieces[0].words.slice(1).map((w) => w.t).join(" ") + " " + r.pieces.slice(1).map((p) => p.text).join(" ") : r.text)));
+      const prefix = cur.marker.kind === "bullet" ? "•" : cur.marker.token;
+      const text = cur.marker.kind === "num" ? scanJoinLines(cur.rows.map((r) => r.text)) : prefix + " " + body;
+      blocks.push({ type: "li", text: text.trim() });
+    } else {
+      const rowsP = cur.rows;
+      let verse = false;
+      if (rowsP.length >= 3) {
+        // Prose wraps mid-sentence, so most of its lines start lowercase;
+        // verse lines each start with a capital.
+        const upper = rowsP.filter((r) => /^[A-Z"“‘']/.test(r.text)).length / rowsP.length;
+        verse = upper >= 0.75;
+      }
+      blocks.push(verse ? { type: "verse", text: rowsP.map((r) => r.text).join("\n") } : { type: "p", text: scanJoinLines(rowsP.map((r) => r.text)) });
+    }
+    cur = null;
+  };
+  let ti = 0;
+  rows.forEach((r, ri) => {
+    if (isTable[ri]) {
+      flush();
+      blocks.push({ type: "row", text: r.pieces.map((p) => p.text).join(" | ") });
+      return;
+    }
+    const i = ti++;
+    const prev = i > 0 ? textRows[i - 1] : null;
+    if (isHeading(r, i)) {
+      if (cur && cur.type === "h" && Math.abs(r.h - cur.h) <= 0.25 * cur.h && r.y0 - prev.y1 < 1.2 * H) cur.rows.push(r);
+      else { flush(); cur = { type: "h", rows: [r], h: r.h }; }
+    } else if (r.marker) {
+      flush();
+      cur = { type: "li", rows: [r], marker: r.marker, markerX: r.x0 };
+    } else if (cur && cur.type === "li" && prev && r.y0 - prev.y1 <= 1.3 * medGap + 0.3 * H && (r.x0 >= cur.markerX + 0.5 * H || /^[a-z]/.test(r.text))) {
+      cur.rows.push(r);
+    } else if (cur && cur.type === "p" && prev && !isParaBreak(prev, r)) {
+      cur.rows.push(r);
+    } else {
+      flush();
+      cur = { type: "p", rows: [r] };
+    }
+  });
+  flush();
+  return blocks;
+}
+
+function scanMergeSplitParagraphs(blocks) {
+  const out = [];
+  blocks.forEach((b) => {
+    const a = out[out.length - 1];
+    if (a && a.type === "p" && b.type === "p" && !SCAN_TERMINAL_RE.test(a.text) && /^[a-z]/.test(b.text)) {
+      a.text = /[A-Za-z]-$/.test(a.text) ? a.text.slice(0, -1) + b.text : a.text + " " + b.text;
+    } else out.push({ type: b.type, text: b.text });
+  });
+  return out;
+}
+
+// One recognized page → ordered, typed blocks. Falls back to the plain-text
+// cleanup if the recognizer returned no usable geometry.
+function scanPageToBlocks(data) {
+  try {
+    const lines = scanCollectLines(data);
+    if (lines.length) {
+      const allWords = lines.flat();
+      const solid = allWords.filter((w) => /[A-Za-z0-9]{3,}/.test(w.t)).map((w) => w.y1 - w.y0);
+      const H = scanMedian(solid.length ? solid : allWords.map((w) => w.y1 - w.y0));
+      if (H > 0) {
+        const ctx = { H, segGap: Math.max(1.4 * H, 6) };
+        const pieces = [];
+        lines.forEach((ws) => {
+          const s = ws.slice().sort((a, b) => a.x0 - b.x0);
+          let curW = [s[0]];
+          for (let i = 1; i < s.length; i++) {
+            if (s[i].x0 - s[i - 1].x1 >= ctx.segGap) { pieces.push(scanMakePiece(curW)); curW = [s[i]]; }
+            else curW.push(s[i]);
+          }
+          pieces.push(scanMakePiece(curW));
+        });
+        const regions = scanOrderRegions(pieces, ctx, 0);
+        let blocks = [];
+        regions.forEach((reg) => { blocks.push(...scanRegionBlocks(reg, ctx)); });
+        blocks = blocks.filter((b) => {
+          if (b.type === "row") return true;
+          if (SCAN_PAGE_NUMBER_RE.test(b.text.trim())) return false; // page numbers
+          return b.text.replace(/[^A-Za-z0-9]/g, "").length >= 2 || b.type === "li";
+        });
+        if (blocks.length) return blocks;
+      }
+    }
+  } catch (e) {
+    console.warn("Scan layout analysis failed — using plain text instead:", e);
+  }
+  return cleanOcrText(data && data.text).split(/\n\n/).filter(Boolean).map((t) => ({ type: "p", text: t }));
+}
+
+// Blocks from one or more pages (in order) → the final text. Sentences that
+// run from one column/page into the next are stitched back together first.
+function scanBlocksToText(blocks) {
+  const merged = scanMergeSplitParagraphs(blocks);
+  let out = "";
+  merged.forEach((b, i) => {
+    if (i) {
+      const prev = merged[i - 1];
+      const tight = (prev.type === "li" && b.type === "li") || (prev.type === "row" && b.type === "row");
+      out += tight ? "\n" : "\n\n";
+    }
+    out += b.text;
+  });
+  return out;
 }
 
 // ===== Generation quality guard =====
@@ -6737,7 +7329,7 @@ const READING_FONT_SIZES = { small: 16, medium: 18, large: 21, xlarge: 24 };
 // regular categories) keep their own category color instead, so each topic
 // still reads visually consistent regardless of paper choice.
 function dropCapColorFor(story, backgroundKey, categoryColor) {
-  if (story && (story.categoryId === "search" || story.categoryId === "pdfImport" || story.categoryId === "webImport")) {
+  if (story && (story.categoryId === "search" || story.categoryId === "pdfImport" || story.categoryId === "webImport" || story.categoryId === "scanImport" || story.categoryId === "scanText")) {
     const bg = READING_BACKGROUNDS[backgroundKey] || READING_BACKGROUNDS.cream;
     return bg.dropCap || categoryColor;
   }
@@ -7947,6 +8539,7 @@ function ResetDataPanel({ state, onResetState }) {
 }
 
 function OnboardingModal({ onClose, state, onRestoreState }) {
+  const [showAboutModal, setShowAboutModal] = useState(false);
   return (
     <div
       style={{
@@ -7986,12 +8579,46 @@ function OnboardingModal({ onClose, state, onRestoreState }) {
 
         <BackupSettingsPanel state={state} onRestoreState={onRestoreState} compact autoRestoreOnSave />
 
+        <div
+          style={{
+            marginTop: 16,
+            paddingTop: 10,
+            borderTop: "1px solid var(--line)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          <div style={{ fontSize: 10.5, color: "#8a9089", textAlign: "center", lineHeight: 1.6 }}>
+            © 2026 Yonatan Eliyahu Lifshitz. All rights reserved.
+            <br />
+            © 2026 יונתן אליהו ליפשיץ. כל הזכויות שמורות.
+          </div>
+          <button
+            onClick={() => setShowAboutModal(true)}
+            style={{
+              border: "none",
+              background: "transparent",
+              color: "#3E7C74",
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: "pointer",
+              textDecoration: "underline",
+              padding: "2px 4px",
+            }}
+          >
+            אודות / תנאים · About / Terms
+          </button>
+        </div>
+
         <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
           <PrimaryButton onClick={onClose} style={{ padding: "9px 20px", fontSize: 13.5 }}>
             המשך לאפליקציה
           </PrimaryButton>
         </div>
       </div>
+      {showAboutModal && <AboutTermsModal onClose={() => setShowAboutModal(false)} />}
     </div>
   );
 }
@@ -8120,7 +8747,7 @@ function FallbackChainStatus() {
   );
 }
 
-function SettingsModal({ onClose, readingPrefs, onChangeReadingPrefs, state, onRestoreState, onResetState }) {
+function SettingsModal({ onClose, readingPrefs, onChangeReadingPrefs, state, onRestoreState, onResetState, initialTab }) {
   const [prefs, setPrefs] = useState(readingPrefs || defaultReadingPrefs());
   function updatePrefs(patch) {
     const next = { ...prefs, ...patch };
@@ -8133,7 +8760,7 @@ function SettingsModal({ onClose, readingPrefs, onChangeReadingPrefs, state, onR
   const [baseUrl, setBaseUrlField] = useState(getCustomBaseUrl());
   const [saved, setSaved] = useState(false);
   const [testState, setTestState] = useState(null); // null | "testing" | {ok:true} | {ok:false, message}
-  const [activeTab, setActiveTab] = useState("display"); // "display" | "api" — page display shows first, API settings are opened from the second tab
+  const [activeTab, setActiveTab] = useState(initialTab || "display"); // "display" | "api" — page display shows first, API settings are opened from the second tab
   const [modelList, setModelList] = useState([]);
   const [modelListState, setModelListState] = useState(null); // null | "loading" | "error"
   const [modelListError, setModelListError] = useState(null);
@@ -8143,6 +8770,7 @@ function SettingsModal({ onClose, readingPrefs, onChangeReadingPrefs, state, onR
   const [quickKey, setQuickKey] = useState("");
   const [quickResult, setQuickResult] = useState(null); // null | {ok:true,label} | {ok:false,message}
   const [showApiInstructions, setShowApiInstructions] = useState(false);
+  const [showAboutModal, setShowAboutModal] = useState(false);
   const [apiViewMode, setApiViewMode] = useState("quick"); // "quick" | "advanced"
   const [showQuotaPanel, setShowQuotaPanel] = useState(false); // collapsed by default — see the quota button below
   const [imgProviderChoice, setImgProviderChoice] = useState(getImageProviderPref()); // "same" | "google" | "openai"
@@ -9085,6 +9713,38 @@ function SettingsModal({ onClose, readingPrefs, onChangeReadingPrefs, state, onR
           <SecondaryButton onClick={onClose}>סגירה</SecondaryButton>
         </div>
         <div style={{ fontSize: 10.5, color: "#b5bab2", marginTop: 14, textAlign: "center" }}>גרסת קובץ: {APP_BUILD_STAMP}</div>
+        <div
+          style={{
+            marginTop: 10,
+            paddingTop: 10,
+            borderTop: "1px solid var(--line)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 6,
+          }}
+        >
+          <div style={{ fontSize: 10.5, color: "#8a9089", textAlign: "center", lineHeight: 1.6 }}>
+            © 2026 Yonatan Eliyahu Lifshitz. All rights reserved.
+            <br />
+            © 2026 יונתן אליהו ליפשיץ. כל הזכויות שמורות.
+          </div>
+          <button
+            onClick={() => setShowAboutModal(true)}
+            style={{
+              border: "none",
+              background: "transparent",
+              color: "#3E7C74",
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: "pointer",
+              textDecoration: "underline",
+              padding: "2px 4px",
+            }}
+          >
+            אודות / תנאים · About / Terms
+          </button>
+        </div>
         {activeTab === "api" && testState && testState !== "testing" && (
           <div
             style={{
@@ -9113,7 +9773,59 @@ function SettingsModal({ onClose, readingPrefs, onChangeReadingPrefs, state, onR
       </div>
     </div>
     {showApiInstructions && <ApiKeyInstructionsModal onClose={() => setShowApiInstructions(false)} />}
+    {showAboutModal && <AboutTermsModal onClose={() => setShowAboutModal(false)} />}
     </>
+  );
+}
+
+// Small standalone "About / Terms" popup — copyright and terms-of-use notice
+// in Hebrew and English, opened from the link at the bottom of Settings.
+function AboutTermsModal({ onClose }) {
+  return (
+    <div
+      style={{
+        position: "fixed", inset: 0, background: "rgba(20,26,22,0.55)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        zIndex: 10000, padding: 16,
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          background: "var(--paper)", borderRadius: 16, maxWidth: 440, width: "100%",
+          maxHeight: "85vh", overflowY: "auto", padding: "22px 22px 18px",
+          border: "1px solid var(--line)", boxShadow: "0 10px 40px rgba(0,0,0,0.25)",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontFamily: "'Frank Ruhl Libre', serif", fontSize: 19, fontWeight: 700 }}>אודות / תנאים</div>
+          <button
+            onClick={onClose}
+            style={{ border: "none", background: "transparent", cursor: "pointer", color: "#8a9089", fontSize: 20, lineHeight: 1, padding: 4 }}
+            aria-label="סגירה"
+          >
+            ×
+          </button>
+        </div>
+
+        <div dir="rtl" style={{ fontSize: 13.5, lineHeight: 1.75, color: "#2b3229", marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>תנאים וזכויות יוצרים:</div>
+          האפליקציה מסופקת כמות שהיא (AS-IS) לשימוש אישי בלבד. כל זכויות היוצרים בקוד המקור, בעיצוב ובתוכן שמורות ליונתן אליהו ליפשיץ
+          (© 2026). אין להעתיק או להפיץ ללא אישור.
+        </div>
+
+        <div dir="ltr" style={{ fontSize: 13.5, lineHeight: 1.75, color: "#2b3229", textAlign: "left" }}>
+          <div style={{ fontWeight: 700, marginBottom: 4 }}>Terms &amp; Copyright:</div>
+          This application is provided "AS-IS" for personal use only. All source code, design, and content are protected under
+          international copyright law (© 2026 Yonatan Eliyahu Lifshitz). Unauthorized copying or distribution is prohibited.
+        </div>
+
+        <div style={{ marginTop: 18, textAlign: "center" }}>
+          <SecondaryButton onClick={onClose}>סגירה</SecondaryButton>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -10009,6 +10721,8 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showPdfImport, setShowPdfImport] = useState(false);
   const [showArticleImport, setShowArticleImport] = useState(false);
+  const [showScanImport, setShowScanImport] = useState(false);
+  const [showScanText, setShowScanText] = useState(false);
   const [deleteStoryId, setDeleteStoryId] = useState(null); // story id pending delete confirmation, or null
   const [phraseMode, setPhraseMode] = useState(false);
   const [phraseAnchor, setPhraseAnchor] = useState(null);
@@ -10024,6 +10738,17 @@ function App() {
   const saveTimer = useRef(null);
   const cloudSyncTimer = useRef(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  // Full-screen app-tour intro slides (screenshots + explanations of the
+  // main buttons/features), shown before the home screen the very first
+  // time the app runs on a given browser profile. Independent of
+  // showOnboarding above (that's the backup/email setup prompt) — the tour
+  // is shown first, and only once it's dismissed does the rest of the app
+  // (including that prompt) appear.
+  const [showTour, setShowTour] = useState(false);
+  // First-ever run only: after the tour ends the Settings modal opens by
+  // itself; the backup/email prompt then waits until Settings is closed.
+  const [onboardingAfterSettings, setOnboardingAfterSettings] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState(null);
   const [cloudSyncStatus, setCloudSyncStatus] = useState(null); // { state: "syncing"|"done"|"error", message } | null
 
   function withApiKeyGuard(err) {
@@ -10060,12 +10785,22 @@ function App() {
         setState(emptyState());
       }
       setReady(true);
+      // The app-tour intro slides: shown exactly once, before anything else,
+      // the very first time the app ever runs on a given browser profile.
+      // Finishing it (or skipping it) marks it done, and only then do we
+      // check whether the backup/email prompt below should also appear.
+      if (!localStorage.getItem(APP_TOUR_KEY)) {
+        setShowTour(true);
+      }
       // The one-time backup/email prompt: shown exactly once, the very first
       // time the app ever runs on a given browser profile. Skipping it (or
       // completing it) both mark it done — from then on, the same setup only
       // lives in Settings → "הגדרת גיבוי ושמירה".
       if (!localStorage.getItem(ONBOARDED_KEY)) {
-        setShowOnboarding(true);
+        // On a first-ever run the tour comes first, then Settings, and only
+        // then this prompt (see onFinish of the tour / SettingsModal onClose).
+        if (localStorage.getItem(APP_TOUR_KEY)) setShowOnboarding(true);
+        else setOnboardingAfterSettings(true);
       }
     })();
   }, []);
@@ -10666,6 +11401,179 @@ function App() {
     setView("story");
     setShowArticleImport(false);
     if (!hasImages) loadChapterImage(storyId, 0, null, article.content);
+    // Deliberately no maybePushStoryToPublicLibrary call here, ever.
+  }
+
+  // Imports a book "typed" from photos of its printed pages: the reader
+  // photographs each page with their camera (grouping photos into chapters
+  // themselves, since there's no reliable way to auto-detect a chapter break
+  // from a photo the way splitPdfIntoChapters can from a PDF's own font
+  // sizes), on-device OCR (Tesseract.js) reads the English text out of each
+  // photo, and the recognized text is kept exactly as read — no AI rewrite —
+  // same "isImported" treatment as a PDF or article import. Like a
+  // web-imported article, this is never public and never has a
+  // public/private choice in its UI at all: categoryId "scanImport" is
+  // hardcoded to always-private in storyIsPublic. UNLIKE a web-imported
+  // article, printing IS allowed (see printStory, which only ever blocks
+  // categoryId "webImport") — the reader photographed their own physical
+  // copy, so a personal-use printout of their own transcription is fine.
+  async function importScannedStory(bookTitle, chapterGroups, onProgress) {
+    if (!window.Tesseract) throw new Error("מנוע זיהוי הטקסט לא נטען (בדקו חיבור לאינטרנט ורעננו את הדף).");
+    const title = (bookTitle || "").trim() || "ספר סרוק";
+    const groups = (chapterGroups || []).filter((g) => g.images && g.images.length);
+    if (!groups.length) throw new Error("לא צולמו עמודים.");
+
+    if (onProgress) onProgress("טוענים את מנוע זיהוי הטקסט…");
+    // One worker reused across every photo (much faster than re-loading the
+    // English language model per image) — always terminated in `finally` so
+    // a failed/aborted import never leaves it running in the background.
+    const worker = await Tesseract.createWorker("eng");
+    const chapters = [];
+    try {
+      const totalImages = groups.reduce((n, g) => n + g.images.length, 0);
+      let doneImages = 0;
+      for (let gi = 0; gi < groups.length; gi++) {
+        const group = groups[gi];
+        // Each page is read WITH word positions and analyzed for layout
+        // (columns, headings, lists, tables…) — see scanPageToBlocks — then
+        // the pages of the chapter are stitched into one text, joining a
+        // sentence that runs from one page onto the next.
+        const chapterBlocks = [];
+        for (let ii = 0; ii < group.images.length; ii++) {
+          doneImages++;
+          if (onProgress) {
+            onProgress(
+              `מזהים טקסט ומבנה עמוד: פרק ${(gi + 1).toLocaleString("he")} מתוך ${groups.length.toLocaleString("he")}, ` +
+                `עמוד ${doneImages.toLocaleString("he")} מתוך ${totalImages.toLocaleString("he")}…`
+            );
+          }
+          const { data } = await worker.recognize(group.images[ii].dataUrl, {}, { text: true, blocks: true });
+          chapterBlocks.push(...scanPageToBlocks(data));
+        }
+        const content = scanBlocksToText(chapterBlocks);
+        if (content) {
+          chapters.push({
+            title: (group.title || "").trim() || `פרק ${chapters.length + 1}`,
+            content,
+          });
+        }
+      }
+    } finally {
+      worker.terminate();
+    }
+    if (!chapters.length) throw new Error("לא זיהינו טקסט קריא באף אחד מהעמודים שצולמו. נסו לצלם שוב, קרוב ובאור טוב יותר.");
+
+    if (onProgress) onProgress("שומרים את הספר…");
+    const storyId = uid();
+    await savePdfRawChapters(storyId, chapters.map((c) => ({ title: c.title, content: c.content, images: [] })));
+
+    const finalChapters = chapters.map((c) => ({ title: c.title, content: c.content, image: null, imageStatus: "loading" }));
+    const avgWordsPerChapter = chapters.reduce((sum, c) => sum + countWords(c.content), 0) / chapters.length;
+    const level = estimateLevelForBook(chapters.length, avgWordsPerChapter);
+
+    const shellStory = {
+      id: storyId,
+      categoryId: "scanImport",
+      level,
+      storyTitle: title,
+      tagline: "",
+      subtopic: "ספר מיובא מסריקת מצלמה",
+      source: "סריקת מצלמה",
+      author: null,
+      isImported: true,
+      isPublic: false, // hardcoded — see storyIsPublic()'s own hardcoded override too
+      frontCoverImage: null,
+      backCoverImage: null,
+      totalChapters: chapters.length,
+      outline: chapters.map((c) => ({ title: c.title, summary: "" })),
+      chapters: finalChapters,
+      read: false,
+      createdAt: Date.now(),
+    };
+    setState((prev) => ({ ...prev, stories: { ...prev.stories, [shellStory.id]: shellStory } }));
+    setActiveStoryId(storyId);
+    setActiveChapterIndex(0);
+    setView("story");
+    setShowScanImport(false);
+    // Every chapter already has its full text (unlike a PDF import, where
+    // only the opened chapter is ever written) so every chapter's
+    // illustration can be requested right away, not just the first one.
+    finalChapters.forEach((c, i) => loadChapterImage(storyId, i, null, c.content));
+    // Deliberately no maybePushStoryToPublicLibrary call here, ever.
+  }
+
+  // Imports a SINGLE continuous piece of text scanned from the camera — for
+  // reading/translating a hand-picked bit of English (a worksheet, a sign, a
+  // paragraph) rather than "typing in" a whole book. One or more photos can
+  // be taken, but — unlike importScannedStory above — they're never grouped
+  // into chapters: every photo's recognized text is simply stitched into one
+  // continuous piece of text, saved as a single-chapter "book", same as an
+  // imported article. Always private (categoryId "scanText" is hardcoded to
+  // always-private in storyIsPublic), but printable — see printStory, which
+  // only ever blocks categoryId "webImport".
+  async function importScannedTextStory(label, images, onProgress) {
+    if (!window.Tesseract) throw new Error("מנוע זיהוי הטקסט לא נטען (בדקו חיבור לאינטרנט ורעננו את הדף).");
+    const photos = images || [];
+    if (!photos.length) throw new Error("לא צולמו תמונות.");
+
+    if (onProgress) onProgress("טוענים את מנוע זיהוי הטקסט…");
+    const worker = await Tesseract.createWorker("eng");
+    let content = "";
+    try {
+      // Word positions are analyzed for page layout (columns, headings,
+      // lists, tables…) — see scanPageToBlocks — instead of trusting the
+      // recognizer's flat text, which reads straight across columns.
+      const allBlocks = [];
+      for (let i = 0; i < photos.length; i++) {
+        if (onProgress) onProgress(`מזהים טקסט ומבנה עמוד: תמונה ${(i + 1).toLocaleString("he")} מתוך ${photos.length.toLocaleString("he")}…`);
+        const { data } = await worker.recognize(photos[i].dataUrl, {}, { text: true, blocks: true });
+        allBlocks.push(...scanPageToBlocks(data));
+      }
+      content = scanBlocksToText(allBlocks);
+    } finally {
+      worker.terminate();
+    }
+    if (!content) throw new Error("לא זיהינו טקסט קריא בתמונות שצולמו. נסו לצלם שוב, קרוב ובאור טוב יותר.");
+
+    // Title: whatever the reader typed, or — if they left it blank — the
+    // first few words of the recognized text itself, same fallback idea as
+    // an article import's page title.
+    const firstLine = content.split("\n").find((l) => l.trim());
+    const autoTitle = firstLine ? firstLine.trim().split(/\s+/).slice(0, 8).join(" ") : "טקסט מצולם";
+    const title = (label || "").trim() || autoTitle;
+
+    if (onProgress) onProgress("שומרים את הטקסט…");
+    const storyId = uid();
+    await savePdfRawChapters(storyId, [{ title, content, images: [] }]);
+
+    const chapter0 = { title, content, image: null, imageStatus: "loading" };
+    const level = estimateLevelForBook(1, countWords(content));
+
+    const shellStory = {
+      id: storyId,
+      categoryId: "scanText",
+      level,
+      storyTitle: title,
+      tagline: "",
+      subtopic: "טקסט מיובא מסריקת מצלמה",
+      source: "סריקת מצלמה",
+      author: null,
+      isImported: true,
+      isPublic: false, // hardcoded — see storyIsPublic()'s own hardcoded override too
+      frontCoverImage: null,
+      backCoverImage: null,
+      totalChapters: 1,
+      outline: [{ title, summary: "" }],
+      chapters: [chapter0],
+      read: false,
+      createdAt: Date.now(),
+    };
+    setState((prev) => ({ ...prev, stories: { ...prev.stories, [shellStory.id]: shellStory } }));
+    setActiveStoryId(storyId);
+    setActiveChapterIndex(0);
+    setView("story");
+    setShowScanText(false);
+    loadChapterImage(storyId, 0, null, content);
     // Deliberately no maybePushStoryToPublicLibrary call here, ever.
   }
 
@@ -11335,6 +12243,26 @@ function App() {
     );
   }
 
+  // Shown once, before the home screen and everything else — a short slide
+  // tour of the app's screens and main buttons. Skipping (or finishing) it
+  // marks APP_TOUR_KEY so it never appears again on this browser profile.
+  if (showTour) {
+    return (
+      <AppTourScreen
+        onFinish={() => {
+          const firstRun = !localStorage.getItem(APP_TOUR_KEY);
+          localStorage.setItem(APP_TOUR_KEY, "1");
+          setShowTour(false);
+          // Very first time: land on the home screen with Settings open.
+          if (firstRun) {
+            setSettingsInitialTab("api");
+            setShowSettings(true);
+          }
+        }}
+      />
+    );
+  }
+
   return (
     <div
       dir="rtl"
@@ -11543,6 +12471,8 @@ function App() {
             onSearch={createSearchedStory}
             onOpenPdfImport={() => setShowPdfImport(true)}
             onOpenArticleImport={() => setShowArticleImport(true)}
+            onOpenScanImport={() => setShowScanImport(true)}
+            onOpenScanText={() => setShowScanText(true)}
             onOpenPublicLibrary={() => setView("publicLibrary")}
           />
         )}
@@ -11564,6 +12494,38 @@ function App() {
           }}
         />
       </div>
+
+      {/* Tiny floating button, bottom-left, home screen only: lets the
+          reader reopen the opening guide (the same slides shown on first
+          run) whenever they want a refresher. Reuses showTour/AppTourScreen
+          — clicking it just re-shows that full-screen tour; "דלג"/finishing
+          it returns here exactly as the first-run tour does. */}
+      {view === "home" && (
+        <button
+          onClick={() => setShowTour(true)}
+          title="מדריך פתיחה — כל מה שהאפליקציה יודעת לעשות"
+          style={{
+            position: "fixed",
+            bottom: "calc(16px + env(safe-area-inset-bottom, 0px))",
+            left: 16,
+            zIndex: 45,
+            width: 38,
+            height: 38,
+            borderRadius: "50%",
+            background: "#3E7C74",
+            color: "#fff",
+            border: "1.5px solid #2f6058",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            boxShadow: "0 3px 12px rgba(62,124,116,0.45)",
+            padding: 0,
+          }}
+        >
+          <AppIcon name="Info" size={18} color="#fff" />
+        </button>
+      )}
 
       {/* The floating "downloading.../ready, tap to enter" cards are only
           useful for jobs the reader has navigated away from — while still on
@@ -11633,6 +12595,18 @@ function App() {
           onImport={importArticleFromUrl}
         />
       )}
+      {showScanImport && (
+        <ScanImportModal
+          onClose={() => setShowScanImport(false)}
+          onImport={importScannedStory}
+        />
+      )}
+      {showScanText && (
+        <ScanTextImportModal
+          onClose={() => setShowScanText(false)}
+          onImport={importScannedTextStory}
+        />
+      )}
       {deleteStoryId && state.stories[deleteStoryId] && (
         <ConfirmDeleteModal
           story={state.stories[deleteStoryId]}
@@ -11642,7 +12616,15 @@ function App() {
       )}
       {showSettings && (
         <SettingsModal
-          onClose={() => setShowSettings(false)}
+          initialTab={settingsInitialTab}
+          onClose={() => {
+            setShowSettings(false);
+            setSettingsInitialTab(null);
+            if (onboardingAfterSettings) {
+              setOnboardingAfterSettings(false);
+              if (!localStorage.getItem(ONBOARDED_KEY)) setShowOnboarding(true);
+            }
+          }}
           readingPrefs={state.readingPrefs}
           onChangeReadingPrefs={(prefs) => setState((prev) => ({ ...prev, readingPrefs: prefs }))}
           state={state}
@@ -11660,6 +12642,911 @@ function App() {
           onRestoreState={(patch) => setState((prev) => mergeBackupPatch(prev, patch))}
         />
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// App tour — full-screen intro slides shown once, before the home screen,
+// the very first time the app runs on a given browser profile. Each slide
+// pairs a small mock "screenshot" (built from the app's own colors/fonts,
+// not a real captured image) with a short explanation of a screen or the
+// important buttons on it. Every slide has a "דלג" (skip) link that jumps
+// straight to the end.
+// ---------------------------------------------------------------------------
+
+// A small non-interactive stand-in for a real screenshot: a rounded panel
+// in the app's own paper/ink palette holding whatever mock UI a slide wants
+// to show, with an optional row of pointer "callouts" underneath pointing
+// out what each part does.
+function TourMockFrame({ children }) {
+  return (
+    <div
+      style={{
+        background: "var(--paper-raised)",
+        border: "1px solid var(--line)",
+        borderRadius: 16,
+        padding: 16,
+        boxShadow: "0 8px 22px rgba(35,52,46,0.08)",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function TourCalloutList({ items }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 14 }}>
+      {items.map((it, i) => (
+        <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+          <div
+            style={{
+              width: 26,
+              height: 26,
+              borderRadius: 8,
+              background: `${it.color || "#3E7C74"}18`,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexShrink: 0,
+              marginTop: 1,
+            }}
+          >
+            <AppIcon name={it.icon} size={13} color={it.color || "#3E7C74"} />
+          </div>
+          <div style={{ fontSize: 13, lineHeight: 1.55 }}>
+            <span style={{ fontWeight: 700 }}>{it.title}</span>
+            {it.body ? <span style={{ color: "#5c665f" }}> — {it.body}</span> : null}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Small numbered circle used on tour tabs.
+function TourDot({ n, active, color }) {
+  return (
+    <span
+      style={{
+        width: 17,
+        height: 17,
+        flexShrink: 0,
+        borderRadius: "50%",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 10,
+        fontWeight: 800,
+        lineHeight: 1,
+        fontFamily: "'IBM Plex Mono', monospace",
+        background: active ? "#fff" : "transparent",
+        color: active ? color : "#8a9089",
+        border: `1.5px solid ${active ? "#fff" : "var(--line-strong)"}`,
+      }}
+    >
+      {n}
+    </span>
+  );
+}
+
+function TourTabs({ tabs }) {
+  const [active, setActive] = useState(0);
+  const current = tabs[active] || tabs[0];
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+        {tabs.map((t, idx) => {
+          const isActive = idx === active;
+          const color = t.color || "#3E7C74";
+          return (
+            <button
+              key={t.key}
+              onClick={() => setActive(idx)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: 12.5,
+                fontWeight: 700,
+                borderRadius: 999,
+                padding: "6px 12px 6px 11px",
+                border: `1.5px solid ${isActive ? color : "var(--line-strong)"}`,
+                background: isActive ? color : "transparent",
+                color: isActive ? "#fff" : "var(--ink)",
+                cursor: "pointer",
+                transition: "background 0.15s ease, color 0.15s ease, border-color 0.15s ease",
+              }}
+            >
+              <TourDot n={idx + 1} active={isActive} color={color} />
+              {t.icon && <AppIcon name={t.icon} size={13} color={isActive ? "#fff" : color} />}
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+      <div key={current.key} className="tour-tab-fade">
+        {current.text && <div style={{ fontSize: 13, color: "#5c665f", lineHeight: 1.6, marginBottom: 12 }}>{current.text}</div>}
+        {current.content}
+      </div>
+    </div>
+  );
+}
+
+// A row of small pill-shaped chips for tour mocks — `active` marks the
+// highlighted one (index), purely visual.
+function TourChips({ labels, active }) {
+  return (
+    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+      {labels.map((lbl, idx) => (
+        <div
+          key={lbl}
+          style={{
+            fontSize: 11,
+            fontWeight: 700,
+            borderRadius: 999,
+            padding: "5px 10px",
+            background: idx === active ? "var(--ink)" : "var(--paper)",
+            color: idx === active ? "var(--paper)" : "var(--ink)",
+            border: "1px solid var(--line-strong)",
+          }}
+        >
+          {lbl}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Small round "floating button" look-alike used in the reading-screen mock.
+function TourRoundBtn({ children, color = "#3E7C74", filled }) {
+  return (
+    <div
+      style={{
+        width: 30,
+        height: 30,
+        borderRadius: "50%",
+        background: filled ? color : "var(--paper)",
+        border: `1.5px solid ${color}`,
+        color: filled ? "#fff" : color,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontFamily: "'IBM Plex Mono', monospace",
+        fontSize: 10,
+        fontWeight: 700,
+        boxShadow: "0 2px 8px rgba(0,0,0,0.18)",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+// App logo shown on the welcome slide (embedded so it works offline).
+const TOUR_LOGO_SRC = "data:image/webp;base64,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";
+
+const TOUR_TAB_LABELS = {
+  welcome: "ברוכים הבאים",
+  home: "מסך הבית",
+  words: "מילים שלי",
+  grammar: "דקדוק",
+  library: "ספרייה",
+  search: "חיפוש ספר",
+  reading: "קריאה",
+  settings: "הגדרות",
+  finish: "סיום",
+};
+
+const TOUR_SLIDES = [
+  {
+    id: "welcome",
+    logo: true,
+    title: "ברוכים הבאים לחדר קריאה",
+    text: "אפליקציית קריאה מדורגת ברמות ללימוד אנגלית: קוראים סיפורים באנגלית, לוחצים על מילה כדי לתרגם, שומרים מילים, לומדים דקדוק ובוחנים את עצמכם. במדריך הזה נעבור על הכול לפי סדר הכפתורים במסך.",
+    mock: null,
+  },
+  {
+    id: "home",
+    title: "מסך הבית והסרגל העליון",
+    text: null,
+    mock: (
+      <TourTabs
+        tabs={[
+          {
+            key: "home",
+            label: "מסך הבית",
+            icon: "BookMarked",
+            color: "#3E7C74",
+            text: "תשעה נושאים: עיון וחברה, מדעים, היסטוריה, ארצות ותרבויות, סיפורי ילדים, האחים גרים, פנטזיה, מחזות ושירה. כל נושא מתקדם ברמה משלו, בלי סוף לרמות.",
+            content: (
+              <TourMockFrame>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  {[
+                    { name: "עיון וחברה", color: "#3E7C74", icon: "Users", level: 6, btn: "המשך קריאה" },
+                    { name: "מדעים", color: "#3E6F9C", icon: "FlaskConical", level: 4, btn: "סיפור חדש" },
+                  ].map((c) => (
+                    <div key={c.name} style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 12, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
+                        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, fontSize: 10.5, color: c.color, border: `1.5px solid ${c.color}`, borderRadius: 999, padding: "2px 7px" }}>L{c.level}</div>
+                        <div style={{ width: 26, height: 26, borderRadius: 8, background: `${c.color}18`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                          <AppIcon name={c.icon} size={13} color={c.color} />
+                        </div>
+                      </div>
+                      <div style={{ fontFamily: "'Frank Ruhl Libre', serif", fontWeight: 700, fontSize: 13 }}>{c.name}</div>
+                      <div style={{ fontSize: 10.5, fontWeight: 700, color: "#fff", background: c.color, borderRadius: 8, padding: "5px 8px", textAlign: "center" }}>{c.btn}</div>
+                    </div>
+                  ))}
+                </div>
+                <TourCalloutList
+                  items={[
+                    { icon: "BarChart2", title: "תג הרמה", body: "עולה כשמסיימים סיפור ולוחצים \"סיפור חדש · רמה הבאה\" בסופו" },
+                    { icon: "Play", title: "כפתור הכרטיס", body: "\"התחל קריאה\" בפעם הראשונה, \"המשך קריאה\" אם יש סיפור פתוח, \"סיפור חדש\" אם סיימתם אחד. הסיפור נכתב עבורכם באותו רגע" },
+                    { icon: "Settings", color: "#C08A3E", title: "פס צהוב בראש המסך", body: "מופיע כשעוד לא חוברה בינה מלאכותית. כפתור בתוכו פותח את ההגדרות" },
+                    { icon: "Info", title: "העיגול הירוק בפינה השמאלית התחתונה", body: "פותח שוב את המדריך הזה, בכל רגע" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "topnav",
+            label: "הסרגל העליון",
+            icon: "Settings",
+            color: "#5c665f",
+            text: "חמישה כפתורים בראש כל מסך, וכל אחד מהם מפורט בשקופיות הבאות. הלוגו \"חדר קריאה\" מחזיר תמיד לבית.",
+            content: (
+              <TourMockFrame>
+                <TourCalloutList
+                  items={[
+                    { icon: "BookMarked", color: "#3E7C74", title: "מילים שלי", body: "המילים ששמרתם, מילון ובחנים (המספר לידו הוא כמות המילים)" },
+                    { icon: "GraduationCap", color: "#3E6F9C", title: "חוקי דקדוק", body: "כל כללי הדקדוק, מדורגים לפי רמה" },
+                    { icon: "Library", color: "#C08A3E", title: "הספרייה שלי", body: "כל הספרים שלכם" },
+                    { icon: "Search", color: "#8c5646", title: "חיפוש ספר", body: "יצירת ספר לפי נושא, ייבוא ומאגר ציבורי" },
+                    { icon: "Settings", color: "#5c665f", title: "הגדרות", body: "תצוגה, חיבור AI וגיבוי" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+        ]}
+      />
+    ),
+  },
+  {
+    id: "words",
+    title: "מילים שלי, מילון ובחנים",
+    text: null,
+    mock: (
+      <TourTabs
+        tabs={[
+          {
+            key: "mywords",
+            label: "מילים שלי",
+            icon: "BookMarked",
+            color: "#3E7C74",
+            text: "כל מילה או ביטוי ששומרים בזמן קריאה נאספים כאן.",
+            content: (
+              <TourMockFrame>
+                <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 10, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontFamily: "'Lora', serif", fontWeight: 600, fontSize: 14, direction: "ltr" }}>community</span>
+                    <span style={{ fontWeight: 700, fontSize: 13 }}>קהילה</span>
+                    <span style={{ flex: 1 }} />
+                    <AppIcon name="Pencil" size={14} color="#b7b2a0" />
+                    <AppIcon name="Trash2" size={14} color="#b7b2a0" />
+                  </div>
+                  <div style={{ fontSize: 12, color: "#5c665f", fontFamily: "'Lora', serif", direction: "ltr", textAlign: "left" }}>a group of people</div>
+                  <div style={{ fontSize: 12.5, fontFamily: "'Lora', serif", direction: "ltr", textAlign: "left" }}>The <b>community</b> built a library.</div>
+                  <div style={{ fontSize: 11, color: "#a8a398" }}>מתוך: The Library Book · עיון וחברה</div>
+                </div>
+                <TourCalloutList
+                  items={[
+                    { icon: "BookMarked", title: "כרטיס מילה", body: "מילה, תרגום, פירוש קצר באנגלית ומשפט לדוגמה (נוצרים אוטומטית)" },
+                    { icon: "Pencil", title: "עיפרון ופח", body: "עריכת המילה והתרגום, או מחיקה (עם אישור)" },
+                    { icon: "History", title: "שורת \"מתוך\"", body: "לחיצה עליה פותחת את הסיפור בדיוק במקום שבו שמרתם את המילה" },
+                    { icon: "Globe", title: "מאגר המילים הציבורי", body: "כפתור להורדת כל המילים שקוראים אחרים תרגמו. מילים שכבר יש לכם לא יוכפלו" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "dictionary",
+            label: "מילון",
+            icon: "Search",
+            color: "#3E6F9C",
+            text: "כפתור \"מילון\" בראש מסך \"מילים שלי\": כל המילים ממוינות לפי א-ב באנגלית.",
+            content: (
+              <TourMockFrame>
+                <TourChips labels={["A", "B", "C", "D", "L", "S"]} active={4} />
+                <TourCalloutList
+                  items={[
+                    { icon: "BookMarked", title: "אותיות", body: "לוחצים על אות כדי לראות רק את המילים שלה. אות בלי מילים מסומנת כריקה" },
+                    { icon: "Plus", title: "הוספת מילה ידנית", body: "כותבים מילה באנגלית ותרגום בעברית, גם בלי לקרוא אותה בסיפור" },
+                    { icon: "Volume2", title: "רמקול", body: "השמעת ההגייה באנגלית" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "quiz",
+            label: "בחן את עצמיך",
+            icon: "Sparkles",
+            color: "#C08A3E",
+            text: "בוחן רב-ברירה מהמילים השמורות. צריך לפחות 4 מילים.",
+            content: (
+              <TourMockFrame>
+                <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 10, padding: "10px 12px" }}>
+                  <div style={{ fontWeight: 700, fontSize: 14, direction: "ltr", textAlign: "left", marginBottom: 8 }}>shore</div>
+                  {[{ t: "חוף", ok: true }, { t: "יער" }, { t: "הר" }].map((o) => (
+                    <div key={o.t} style={{ fontSize: 12.5, borderRadius: 8, padding: "6px 10px", marginBottom: 5, border: `1.5px solid ${o.ok ? "#3E7C74" : "var(--line-strong)"}`, background: o.ok ? "#3E7C7418" : "transparent", color: o.ok ? "#3E7C74" : "var(--ink)", fontWeight: o.ok ? 700 : 500 }}>{o.t}</div>
+                  ))}
+                </div>
+                <TourCalloutList
+                  items={[
+                    { icon: "RotateCw", title: "שני כיוונים", body: "אנגלית ← עברית או עברית ← אנגלית" },
+                    { icon: "Sparkles", title: "עד 15 שאלות", body: "מילים שעוד לא נבחנו או שטעיתם בהן מופיעות יותר" },
+                    { icon: "ChevronRight", title: "שאלה קודמת / הבאה", body: "אפשר לחזור אחורה. בסוף מקבלים תוצאות" },
+                    { icon: "History", title: "סטטיסטיקת בחנים", body: "רשימת כל הבחנים שסיימתם עם אחוזי הצלחה, ואפשר לפתוח כל אחד" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+        ]}
+      />
+    ),
+  },
+  {
+    id: "grammar",
+    title: "חוקי דקדוק",
+    text: "רשימה מלאה של כללי הדקדוק באנגלית, מהבסיס עד רמה ספרותית, ללימוד עצמי ובלי קשר לסיפור מסוים.",
+    mock: (
+      <TourMockFrame>
+        <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, borderRadius: 999, padding: "5px 10px", background: "#3E7C7418", border: "1px solid #3E7C74", color: "#3E7C74", display: "flex", alignItems: "center", gap: 4 }}>
+            <AppIcon name="GraduationCap" size={12} color="#3E7C74" /> דקדוק רגיל
+          </div>
+          <div style={{ fontSize: 11.5, fontWeight: 700, borderRadius: 999, padding: "5px 10px", border: "1px solid var(--line-strong)", display: "flex", alignItems: "center", gap: 4 }}>
+            <AppIcon name="Feather" size={12} /> דקדוק שירה
+          </div>
+        </div>
+        <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 10, padding: "10px 12px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, fontSize: 10.5, color: "#3E7C74", border: "1.5px solid #3E7C74", borderRadius: 999, padding: "2px 7px" }}>L2</span>
+            <span style={{ fontWeight: 700, fontSize: 13 }}>Simple Past Tense</span>
+          </div>
+          <div style={{ fontSize: 12, color: "#3d453f" }}>מתאר פעולה שהסתיימה בעבר.</div>
+        </div>
+        <TourCalloutList
+          items={[
+            { icon: "GraduationCap", title: "שתי לשוניות", body: "דקדוק רגיל, ודקדוק שירה (משקל, חריזה וסגנון)" },
+            { icon: "Check", title: "\"נלמד\"", body: "כללים שהרמה שלכם כבר הגיעה אליהם מסומנים כנלמדו" },
+            { icon: "Volume2", color: "#3E6F9C", title: "סימון בתוך סיפור", body: "צביעת הכללים בטקסט עצמו נעשית מתוך מסך הקריאה, כמפורט בשקופית הקריאה" },
+          ]}
+        />
+      </TourMockFrame>
+    ),
+  },
+  {
+    id: "library",
+    title: "הספרייה שלי",
+    text: "כל הספרים שיצרתם, ייבאתם או הורדתם, במקום אחד.",
+    mock: (
+      <TourMockFrame>
+        <TourChips labels={["גודל", "נושא", "אחרון שנקרא", "הספרים שאהבתי"]} active={2} />
+        <div style={{ height: 8 }} />
+        {[
+          { title: "The Library Book", tag: "מדעים · 12/12 פרקים", pub: true, liked: true, note: "נקרא" },
+          { title: "The Day the King Signed", tag: "היסטוריה · 2/4 פרקים", pub: false, liked: false, note: "בתהליך" },
+        ].map((s) => (
+          <div key={s.title} style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 10, padding: "8px 10px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 6 }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 700, fontSize: 13, direction: "ltr", textAlign: "left" }}>{s.title}</div>
+              <div style={{ fontSize: 11.5, color: "#5c665f", marginTop: 2 }}>{s.tag} · <span style={{ color: s.note === "נקרא" ? "#3E7C74" : "#C08A3E", fontWeight: 700 }}>{s.note}</span></div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <AppIcon name={s.liked ? "HeartFill" : "Heart"} size={15} color={s.liked ? "#b5493f" : "#8a9089"} />
+              <AppIcon name="Trash2" size={15} color="#8a9089" />
+            </div>
+          </div>
+        ))}
+        <TourCalloutList
+          items={[
+            { icon: "BarChart2", title: "מיון", body: "לפי גודל הספר, נושא, מה שנקרא לאחרונה, או רק ספרים שאהבתם" },
+            { icon: "Globe", title: "סינון", body: "בסידור לפי גודל או נושא אפשר לצמצם, ובנושא גם ל\"ציבורי\" או \"פרטי\"" },
+            { icon: "Heart", title: "לב", body: "מוסיף את הספר ל\"הספרים שאהבתי\"" },
+            { icon: "Trash2", title: "פח", body: "מוחק ספר אחד, עם אישור, בלי לפגוע בשאר" },
+            { icon: "CloudOff", title: "\"טרם סונכרן למאגר\"", body: "ספר ציבורי שעוד לא עלה למאגר. לחיצה עליו נותנת הסבר וסנכרון ידני" },
+          ]}
+        />
+      </TourMockFrame>
+    ),
+  },
+  {
+    id: "search",
+    title: "חיפוש ספר: יצירה, ייבוא ומאגר",
+    text: null,
+    mock: (
+      <TourTabs
+        tabs={[
+          {
+            key: "create",
+            label: "יצירת ספר",
+            icon: "Search",
+            color: "#8c5646",
+            text: "מקלידים שם ספר או נושא, בעברית או באנגלית, בוחרים רמה, ולוחצים \"חפשו וצרו\". האפליקציה כותבת ספר מקורי בהשראתו.",
+            content: (
+              <TourMockFrame>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 10 }}>
+                  <div style={{ flex: 1, border: "1.5px solid var(--line-strong)", borderRadius: 10, padding: "8px 10px", fontSize: 12, color: "#8a9089" }}>Robinson Crusoe</div>
+                  <div style={{ fontSize: 11, fontWeight: 700, borderRadius: 999, padding: "6px 10px", background: "var(--ink)", color: "var(--paper)", display: "flex", alignItems: "center", gap: 4 }}>
+                    <AppIcon name="Globe" size={11} color="var(--paper)" /> ציבורי
+                  </div>
+                </div>
+                <TourChips labels={["בסיסית", "קטן", "בינוני", "גדול", "מלא"]} active={1} />
+                <TourCalloutList
+                  items={[
+                    { icon: "Globe", title: "ציבורי / פרטי", body: "ציבורי יעלה גם למאגר של כולם. פרטי נשאר רק אצלכם" },
+                    { icon: "BarChart2", title: "רמה וגודל", body: "בוחרים גודל ספר, או מקלידים מספר רמה מדויק. מתחת מוצג כמה פרקים ומילים צפויים" },
+                    { icon: "RotateCw", title: "פרקים בהדרגה", body: "הפרקים נכתבים תוך כדי קריאה, אז אין המתנה ארוכה" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "import",
+            label: "ייבוא",
+            icon: "FileUp",
+            color: "#3E6F9C",
+            text: "מתחת ליצירה יש ארבע דרכים להביא טקסט קיים.",
+            content: (
+              <TourMockFrame>
+                <TourCalloutList
+                  items={[
+                    { icon: "FileUp", color: "#3E6F9C", title: "ייבוא מ-PDF", body: "מעלים ספר באנגלית. הטקסט המקורי נשאר כמו שהוא ומחולק לפרקים לפי הספר. אפשר לבחור אם הספר ציבורי" },
+                    { icon: "Link", color: "#3E6F9C", title: "ייבוא מקישור", body: "מדביקים כתובת של כתבה באנגלית, והאפליקציה מוציאה רק את גוף הכתבה והתמונות. הכתבה פרטית בלבד ואי אפשר להדפיס אותה" },
+                    { icon: "Camera", color: "#B0793E", title: "סריקת טקסט", body: "מצלמים תמונה אחת או כמה, והטקסט מהן מתחבר לקטע קריאה רציף אחד — בלי פרקים ובלי להיחשב ספר. פרטי, אבל אפשר להדפיס" },
+                    { icon: "Camera", color: "#6B5B95", title: "סריקה לספר", body: "מצלמים עמודים מספר מודפס, והטקסט מוקלד אוטומטית בדיוק כמו שהוא, מחולק לפרקים. הספר פרטי בלבד, אבל כן אפשר להדפיס אותו" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "public",
+            label: "מאגר ציבורי",
+            icon: "Globe",
+            color: "#C08A3E",
+            text: "כפתור \"למאגר\" פותח את כל הספרים שקוראים אחרים יצרו (זמין כשגיבוי הענן מוגדר על Firebase).",
+            content: (
+              <TourMockFrame>
+                <TourCalloutList
+                  items={[
+                    { icon: "Library", color: "#C08A3E", title: "עיון", body: "מיון לפי נושא או גודל" },
+                    { icon: "Plus", color: "#C08A3E", title: "הורידו", body: "מוסיף ספר לספרייה שלכם. ספר שכבר אצלכם מסומן \"בספרייה שלך\"" },
+                    { icon: "Globe", color: "#C08A3E", title: "הורידו את כל המאגר", body: "מוריד את כל הספרים בבת אחת" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+        ]}
+      />
+    ),
+  },
+  {
+    id: "reading",
+    title: "קריאת סיפור",
+    text: null,
+    mock: (
+      <TourTabs
+        tabs={[
+          {
+            key: "top",
+            label: "סרגל עליון",
+            icon: "BookOpen",
+            color: "#3E7C74",
+            text: "מלמעלה למטה: פס כותרת, שורת כפתורים ותפריט פרקים.",
+            content: (
+              <TourMockFrame>
+                <TourCalloutList
+                  items={[
+                    { icon: "Heart", color: "#B5658A", title: "לב, מדפסת, חזרה", body: "הלב מוסיף ל\"הספרים שאהבתי\". המדפסת שומרת את הספר כ-PDF (לא זמין בכתבות מקישור). \"חזרה\" חוזר אחורה" },
+                    { icon: "ChevronLeft", title: "סיפור הבא / קודם", body: "מעבר לסיפור ברמה הבאה או הקודמת באותו נושא" },
+                    { icon: "History", title: "עבור למיקום אחרון", body: "חוזר למקום שבו הפסקתם, או לסימנייה שהצבתם" },
+                    { icon: "GraduationCap", title: "חוקי דקדוק בסיפור זה", body: "ראו לשונית דקדוק. בשירה יש גם \"דקדוק שירה\"" },
+                    { icon: "Search", title: "חיפוש בספר", body: "מקלידים מילה, לוחצים על תוצאה וקופצים אליה" },
+                    { icon: "BookOpen", title: "תפריט פרקים", body: "הרשימה מתחת לכפתורים: לוחצים על פרק כדי לעבור אליו, ואם הוא עוד לא נכתב הוא נכתב עכשיו. אם הכריכות מופעלות בהגדרות, אפשר להגיע גם אליהן" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "aloud",
+            label: "הקראה",
+            icon: "Volume2",
+            color: "#3E6F9C",
+            text: "שורה נפרדת מתחת לכפתורים, עם הקראה בקול של הפרק.",
+            content: (
+              <TourMockFrame>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+                  <div style={{ fontSize: 11.5, fontWeight: 700, border: "1.5px solid var(--line-strong)", borderRadius: 10, padding: "5px 9px", display: "flex", alignItems: "center", gap: 4 }}>
+                    <AppIcon name="Play" size={11} /> הקראה
+                  </div>
+                  <div style={{ flex: 1 }} />
+                  {["0.5", "1", "1.5", "2"].map((r, i) => (
+                    <div key={r} style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, fontWeight: 600, borderRadius: 999, padding: "3px 6px", border: "1.5px solid var(--line-strong)", background: i === 1 ? "var(--ink)" : "transparent", color: i === 1 ? "var(--paper)" : "var(--ink)" }}>{r}</div>
+                  ))}
+                </div>
+                <TourCalloutList
+                  items={[
+                    { icon: "Play", title: "הקראה / השהיה / המשך", body: "ההקראה מתחילה ממקום הקריאה. הכפתור משתנה להשהיה ואז להמשך, ו-X עוצר לגמרי" },
+                    { icon: "Sparkles", title: "המילה הנקראת מודגשת", body: "בצהוב, כדי לעקוב אחריה בעיניים" },
+                    { icon: "Volume2", title: "מהירות", body: "מ-0.25 עד 2, וההגדרה נשמרת. אפשר לשנות גם באמצע הקראה" },
+                    { icon: "Search", title: "לחיצה על מילה בזמן השהיה", body: "ההקראה תמשיך משם" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "translate",
+            label: "תרגום מילה וביטוי",
+            icon: "Search",
+            color: "#C08A3E",
+            text: "לוחצים על כל מילה בטקסט, גם בכותרות, ומקבלים תרגום מותאם להקשר.",
+            content: (
+              <TourMockFrame>
+                <div style={{ fontFamily: "'Lora', serif", fontSize: 14, lineHeight: 1.8, direction: "ltr", textAlign: "left", marginBottom: 10 }}>
+                  The old lighthouse stood by the <span style={{ borderBottom: "2px solid #C08A3E", background: "rgba(192,138,62,0.12)" }}>shore</span>.
+                </div>
+                <div style={{ width: 170, margin: "0 auto", background: "var(--ink)", color: "var(--paper)", borderRadius: 12, padding: "10px 12px" }}>
+                  <div style={{ width: 30, height: 4, borderRadius: 4, background: "rgba(255,255,255,0.35)", margin: "0 auto 6px" }} />
+                  <div style={{ fontFamily: "'Lora', serif", fontStyle: "italic", fontSize: 12, opacity: 0.75, direction: "ltr", textAlign: "left" }}>shore</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 700, fontSize: 14, margin: "4px 0 8px" }}>
+                    חוף <AppIcon name="Pencil" size={12} color="#fff" />
+                  </div>
+                  <div style={{ fontSize: 11.5, fontWeight: 700, background: "#3E7C74", borderRadius: 8, padding: "5px 8px", textAlign: "center" }}>הוסף למילים שלי</div>
+                </div>
+                <TourCalloutList
+                  items={[
+                    { icon: "Search", title: "חלונית התרגום", body: "מופיעה ליד המילה. אפשר לגרור אותה בידית שבראשה אם היא מסתירה טקסט, ולסגור ב-X או בלחיצה בחוץ" },
+                    { icon: "Pencil", title: "עיפרון", body: "מתקנים את התרגום בעצמכם, והתיקון נשמר גם למילה השמורה" },
+                    { icon: "Heart", color: "#C08A3E", title: "הוסף למילים שלי", body: "שומר את המילה. לחיצה נוספת (\"נשמר במילים שלי\") מסירה אותה. מילה שמורה מסומנת בקו זהוב, מילה רגילה בקו מקווקו" },
+                    { icon: "Plus", title: "תרגום ביטוי או משפט", body: "לוחצים על הכפתור \"תרגום ביטוי/משפט\" בתחתית הפרק (או ⋯T הצף), ואז על המילה הראשונה ועל האחרונה. הלחיצה שוב על הכפתור מחזירה למילה בודדת" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "floating",
+            label: "כפתורים צפים",
+            icon: "Sparkles",
+            color: "#8c5646",
+            text: "כשגוללים מטה והשורה העליונה יוצאת מהמסך, מופיעים בצד ימין למעלה עיגולים שמחזירים את הפעולות החשובות בלי לחזור למעלה.",
+            content: (
+              <TourMockFrame>
+                <div style={{ display: "flex", gap: 10, justifyContent: "center", marginBottom: 4 }}>
+                  <TourRoundBtn filled><AppIcon name="Pause" size={13} color="#fff" /></TourRoundBtn>
+                  <TourRoundBtn><AppIcon name="Search" size={13} color="#3E7C74" /></TourRoundBtn>
+                  <TourRoundBtn><AppIcon name="BookMarked" size={13} color="#3E7C74" /></TourRoundBtn>
+                  <TourRoundBtn>⋯T</TourRoundBtn>
+                </div>
+                <TourCalloutList
+                  items={[
+                    { icon: "Pause", title: "השהיה / המשך הקראה", body: "מופיע רק בזמן הקראה, ואפשר לכבות אותו בהגדרות" },
+                    { icon: "Search", title: "חיפוש בספר", body: "אותה חלונית חיפוש כמו בסרגל" },
+                    { icon: "BookMarked", title: "סימנייה", body: "שומרת את המקום שבו אתם עומדים, אחת לכל ספר. לחיצה כשאתם באותו מקום מסירה אותה. \"עבור למיקום אחרון\" יחזיר אתכם אליה" },
+                    { icon: "Plus", title: "⋯T", body: "מעבר בין תרגום מילה לתרגום ביטוי" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "grammar",
+            label: "דקדוק בסיפור",
+            icon: "GraduationCap",
+            color: "#3E6F9C",
+            text: "כפתור \"חוקי דקדוק בסיפור זה\" צובע כללים ישירות בטקסט.",
+            content: (
+              <TourMockFrame>
+                <div style={{ fontFamily: "'Lora', serif", fontSize: 13.5, lineHeight: 1.85, direction: "ltr", textAlign: "left" }}>
+                  When the first <span style={{ background: "#3E7C7440", borderRadius: 4, padding: "0 2px" }}>snow fell</span>, the library door <span style={{ background: "#b5493f30", borderRadius: 4, padding: "0 2px" }}>opened</span>.
+                </div>
+                <TourCalloutList
+                  items={[
+                    { icon: "GraduationCap", title: "רשימת כללים", body: "מוצגים הכללים שנלמדו עד רמת הסיפור, ובראשם \"חדש בסיפור הזה\"" },
+                    { icon: "Check", title: "סמן דקדוק", body: "ליד כל כלל. סורק את הפרק וצובע בצבע קבוע. \"בטל סימון\" מסיר, ולפעמים תופיע הודעה שלא נמצאה דוגמה בפרק" },
+                    { icon: "Check", title: "סמן הכל / נקה סימונים", body: "שליטה על כל הכללים בבת אחת" },
+                    { icon: "Volume2", title: "לחיצה על מילה צבועה", body: "מסבירה איזה כלל חל עליה" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "nav",
+            label: "ניווט וסיום",
+            icon: "ChevronLeft",
+            color: "#5c665f",
+            text: "הכפתורים שמתחת לטקסט, והחלקה עם האצבע.",
+            content: (
+              <TourMockFrame>
+                <TourCalloutList
+                  items={[
+                    { icon: "ChevronLeft", title: "הפרק הבא / הפרק הקודם", body: "בדפדוף קלאסי יש גם \"עמוד הבא / קודם\". אפשר להחליק שמאלה או ימינה: קודם בין עמודים, ובקצה עוברים פרק" },
+                    { icon: "Check", title: "סמן כנקרא", body: "סימון שהספר נקרא. לחיצה נוספת מבטלת" },
+                    { icon: "BarChart2", title: "בסוף הספר", body: "\"סיפור חדש · רמה הבאה\" מעלה רמה, ו\"סיפור נוסף באותה רמה\" נשאר בה" },
+                    { icon: "BookOpen", title: "כריכה קדמית ואחורית", body: "אם הופעלו בהגדרות. בספר של 3 פרקים לפחות" },
+                    { icon: "RotateCw", title: "\"נסה שוב\"", body: "אם כתיבת פרק נכשלה, מופיע כפתור לנסות שוב" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+        ]}
+      />
+    ),
+  },
+  {
+    id: "settings",
+    title: "הגדרות",
+    text: null,
+    mock: (
+      <TourTabs
+        tabs={[
+          {
+            key: "display",
+            label: "תצוגת עמוד",
+            icon: "BookOpen",
+            color: "#5c665f",
+            text: "התאמת הקריאה. אחרי שינוי לוחצים \"שמור\".",
+            content: (
+              <TourMockFrame>
+                <TourCalloutList
+                  items={[
+                    { icon: "BookOpen", title: "גודל אותיות, רקע וגופן", body: "לנוחות העיניים" },
+                    { icon: "ChevronLeft", title: "מעבר בין עמודים", body: "גלילה רציפה, או דפדוף קלאסי עמוד אחרי עמוד" },
+                    { icon: "Play", title: "כפתור הקראה מרחף", body: "מוצג בגלילה או מוסתר" },
+                    { icon: "Library", title: "עמוד כריכה", body: "מוצג או מוסתר" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "api",
+            label: "הגדרות API",
+            icon: "KeyRound",
+            color: "#3E6F9C",
+            text: "הבינה המלאכותית כותבת את הסיפורים ומתרגמת. בלי מפתח לא ייווצר תוכן.",
+            content: (
+              <TourMockFrame>
+                <TourCalloutList
+                  items={[
+                    { icon: "KeyRound", title: "חיבור מהיר", body: "מדביקים מפתח API של כל ספק (Groq, Google, OpenAI, Anthropic ועוד) והאפליקציה מזהה אותו לבד" },
+                    { icon: "Info", title: "הוראות להכנסת חיבור API", body: "קישור עם מדריך צעד אחר צעד. מומלץ להגדיר Groq ו-Google (Gemini), והאפליקציה עוברת ביניהם אוטומטית כשלאחד נגמרת המכסה" },
+                    { icon: "BarChart2", title: "מכסת טוקנים ובקשות", body: "מציג כמה נשאר בכל ספק, ומאפשר לכבות ספק זמנית" },
+                    { icon: "Settings", title: "הגדר API מותאם אישית", body: "מצב מתקדם: בחירת ספק ומודל, כתובת שרת, מודל לאיורים ובדיקת חיבור" },
+                  ]}
+                />
+                <div style={{ fontSize: 12, color: "#8a9089", marginTop: 10 }}>המפתחות נשמרים רק בדפדפן שלכם.</div>
+              </TourMockFrame>
+            ),
+          },
+          {
+            key: "backup",
+            label: "גיבוי ושמירה",
+            icon: "RotateCw",
+            color: "#3E7C74",
+            text: "כדי שהספרים, הרמות והמילים לא יאבדו ויעברו בין מכשירים.",
+            content: (
+              <TourMockFrame>
+                <TourCalloutList
+                  items={[
+                    { icon: "Users", title: "חשבון Google ומייל", body: "מתחברים עם Google (ההתחברות נפתחת מעצמה בעת גיבוי או שחזור)" },
+                    { icon: "RotateCw", title: "גיבוי אוטומטי וגבה עכשיו", body: "אוטומטי מגבה ברקע בכל שינוי. אפשר גם לכבות ולגבות ידנית" },
+                    { icon: "History", title: "שחזור", body: "\"מצב נוכחי\" משלים רק מה שחסר. \"היסטוריה מלאה\" מחזיר כל מה שנצבר. שניהם לא דורסים התקדמות קיימת" },
+                    { icon: "Trash2", color: "#b5493f", title: "איפוס האפליקציה", body: "מוחק מהמכשיר את הספרים והמילים, אחרי גיבוי אוטומטי, כדי שאפשר יהיה לשחזר" },
+                  ]}
+                />
+              </TourMockFrame>
+            ),
+          },
+        ]}
+      />
+    ),
+  },
+  {
+    id: "finish",
+    icon: "Sparkles",
+    title: "מוכנים להתחיל!",
+    text: "קודם חברו מפתח API בהגדרות, אחר כך בחרו נושא בבית ולחצו \"התחל קריאה\". לחצו על מילה כדי לתרגם ולשמור. אפשר לחזור למדריך בכל רגע בעיגול הירוק בתחתית מסך הבית.",
+    mock: null,
+  },
+];
+
+
+
+function AppTourScreen({ onFinish }) {
+  const [i, setI] = useState(0);
+  const [showAboutModal, setShowAboutModal] = useState(false);
+  const slide = TOUR_SLIDES[i];
+  const isLast = i === TOUR_SLIDES.length - 1;
+  const isFirst = i === 0;
+
+  const tabBarRef = useRef(null);
+  useEffect(() => {
+    const el = tabBarRef.current && tabBarRef.current.querySelector('[data-active="1"]');
+    if (el && el.scrollIntoView) el.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
+  }, [i]);
+
+  return (
+    <div
+      dir="rtl"
+      style={{
+        "--paper": "#ECEEE6",
+        "--paper-raised": "#F6F5EF",
+        "--ink": "#23342E",
+        "--line": "#D9D4C4",
+        "--line-strong": "#C7C2AE",
+        background: "var(--paper)",
+        color: "var(--ink)",
+        minHeight: 560,
+        fontFamily: "'Assistant', sans-serif",
+        borderRadius: 16,
+        overflow: "hidden",
+        position: "relative",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Frank+Ruhl+Libre:wght@500;700&family=Assistant:wght@400;500;600;700;800&family=Lora:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@500;600&display=swap');
+        @keyframes tourFadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+        .tour-tab-fade { animation: tourFadeIn 0.2s ease; }
+      `}</style>
+
+      {/* Skip — always available, on every slide */}
+      <div style={{ display: "flex", justifyContent: "flex-start", padding: "16px 20px 0" }}>
+        <SecondaryButton onClick={onFinish} style={{ padding: "7px 12px", fontSize: 12.5, border: "1.5px solid transparent", color: "#5c665f" }}>
+          דלג
+          <AppIcon name="X" size={12} />
+        </SecondaryButton>
+      </div>
+
+      {/* Tab bar: one tab per explanation page (the welcome screen has none) */}
+      {i > 0 && (
+      <div style={{ padding: "6px 0 0" }}>
+        <div
+          ref={tabBarRef}
+          style={{ display: "flex", gap: 6, overflowX: "auto", padding: "4px 20px 6px", scrollbarWidth: "none" }}
+        >
+          {TOUR_SLIDES.map((s, idx) => {
+            if (idx === 0) return null; // welcome screen has no tab
+            const isActive = idx === i;
+            return (
+              <button
+                key={s.id}
+                data-active={isActive ? "1" : "0"}
+                onClick={() => setI(idx)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  flexShrink: 0,
+                  whiteSpace: "nowrap",
+                  fontSize: 12.5,
+                  fontWeight: 700,
+                  borderRadius: 999,
+                  padding: "6px 12px 6px 11px",
+                  border: `1.5px solid ${isActive ? "var(--ink)" : "var(--line-strong)"}`,
+                  background: isActive ? "var(--ink)" : "transparent",
+                  color: isActive ? "var(--paper)" : "var(--ink)",
+                  cursor: "pointer",
+                }}
+              >
+                <TourDot n={idx} active={isActive} color="#3E7C74" />
+                {TOUR_TAB_LABELS[s.id] || s.title}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      )}
+
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", padding: "20px 16px 22px", margin: "12px 16px 16px", border: "1.5px solid var(--line-strong)", borderRadius: 16, background: "var(--paper-raised)" }}>
+        {slide.logo && (
+          <img
+            src={TOUR_LOGO_SRC}
+            alt="Library — English books"
+            style={{ width: 132, height: 132, borderRadius: 30, display: "block", margin: "0 auto 18px", boxShadow: "0 6px 20px rgba(35,52,46,0.18)" }}
+          />
+        )}
+        {slide.icon && (
+          <div
+            style={{
+              width: 56,
+              height: 56,
+              borderRadius: 14,
+              background: "var(--ink)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              margin: "0 auto 18px",
+            }}
+          >
+            <AppIcon name={slide.icon} size={26} color="var(--paper)" />
+          </div>
+        )}
+        <div style={{ fontFamily: "'Frank Ruhl Libre', serif", fontSize: 22, fontWeight: 700, textAlign: "center" }}>{slide.title}</div>
+        {slide.text && (
+          <div style={{ color: "#5c665f", fontSize: 14, marginTop: 8, lineHeight: 1.6, textAlign: "center", maxWidth: 420, marginInline: "auto" }}>
+            {slide.text}
+          </div>
+        )}
+        {slide.mock && <div key={slide.id} style={{ marginTop: 20, maxWidth: 440, marginInline: "auto", width: "100%" }}>{slide.mock}</div>}
+      </div>
+
+      {showAboutModal && <AboutTermsModal onClose={() => setShowAboutModal(false)} />}
+
+      <div style={{ padding: "0 20px 24px" }}>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+          {!isFirst && (
+            <SecondaryButton onClick={() => setI((n) => Math.max(0, n - 1))}>
+              <AppIcon name="ChevronRight" size={15} />
+              הקודם
+            </SecondaryButton>
+          )}
+          <PrimaryButton onClick={() => (isLast ? onFinish() : setI((n) => Math.min(TOUR_SLIDES.length - 1, n + 1)))} style={{ flex: isFirst ? 1 : undefined }}>
+            {isLast ? "בואו נתחיל" : "הבא"}
+            {!isLast && <AppIcon name="ChevronLeft" size={15} />}
+          </PrimaryButton>
+        </div>
+
+        {isFirst && (
+          <div
+            style={{
+              marginTop: 18,
+              paddingTop: 12,
+              borderTop: "1px solid var(--line)",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 6,
+            }}
+          >
+            <div style={{ fontSize: 10.5, color: "#8a9089", textAlign: "center", lineHeight: 1.6 }}>
+              © 2026 Yonatan Eliyahu Lifshitz. All rights reserved.
+              <br />
+              © 2026 יונתן אליהו ליפשיץ. כל הזכויות שמורות.
+            </div>
+            <button
+              onClick={() => setShowAboutModal(true)}
+              style={{
+                border: "none",
+                background: "transparent",
+                color: "#3E7C74",
+                fontSize: 11,
+                fontWeight: 700,
+                cursor: "pointer",
+                textDecoration: "underline",
+                padding: "2px 4px",
+              }}
+            >
+              אודות / תנאים · About / Terms
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -11784,7 +13671,7 @@ function bookSizeBandLabel(band) {
   return `${band.label} (רמה ${band.levelRange}) · ${chapters} פרקים`;
 }
 
-function SearchView({ onSearch, onOpenPdfImport, onOpenArticleImport, onOpenPublicLibrary }) {
+function SearchView({ onSearch, onOpenPdfImport, onOpenArticleImport, onOpenScanImport, onOpenScanText, onOpenPublicLibrary }) {
   const [query, setQuery] = useState("");
   const [level, setLevel] = useState(10);
   const [isPublic, setIsPublic] = useState(true);
@@ -11973,6 +13860,37 @@ function SearchView({ onSearch, onOpenPdfImport, onOpenArticleImport, onOpenPubl
           <AppIcon name="Link" size={15} />
           ייבוא מקישור
         </SecondaryButton>
+      </div>
+
+      <div
+        style={{
+          marginTop: 14,
+          paddingTop: 14,
+          borderTop: "1px solid var(--line)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+          flexWrap: "wrap",
+        }}
+      >
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 14.5 }}>רוצים לצלם מהמצלמה?</div>
+          <div style={{ fontSize: 12.5, color: "#8a9089", marginTop: 3 }}>
+            "סריקת טקסט" — תמונה אחת או כמה, לקטע קריאה רציף אחד (בלי פרקים, לא נחשב "ספר"). "סריקה לספר" —
+            עמודי ספר מודפס, מחולקים לפרקים כמו ספר אמיתי. שני הסוגים נשמרים פרטיים בלבד, וניתן להדפיס את שניהם.
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <SecondaryButton onClick={onOpenScanText} style={{ padding: "9px 14px", fontSize: 13, whiteSpace: "nowrap" }}>
+            <AppIcon name="Camera" size={15} />
+            סריקת טקסט
+          </SecondaryButton>
+          <SecondaryButton onClick={onOpenScanImport} style={{ padding: "9px 14px", fontSize: 13, whiteSpace: "nowrap" }}>
+            <AppIcon name="Camera" size={15} />
+            סריקה לספר
+          </SecondaryButton>
+        </div>
       </div>
 
       <div
@@ -12720,6 +14638,864 @@ function ArticleImportModal({ onClose, onImport }) {
     </div>
   );
 }
+
+// Full-screen "document scan" camera. Instead of handing off to the phone's
+// classic camera app (<input capture>), this opens a live viewfinder with a
+// page-shaped frame (A4 proportions, switchable to landscape) over a dimmed
+// background, so the user can line the page up inside the borders. Each shot
+// is CROPPED to exactly what is inside the frame — which also gives the OCR
+// (Tesseract) a tighter, cleaner image with less background noise. The
+// viewfinder stays open between shots so several pages can be taken in a row.
+// If the live camera isn't available (permission denied, unsupported browser,
+// no HTTPS) it offers the classic camera via onFallback instead of failing.
+function CameraScanner({ onCapture, onClose, onFallback, title = "סריקת עמוד" }) {
+  const wrapRef = useRef(null);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const [ready, setReady] = useState(false);
+  const [error, setError] = useState(null); // null | "denied" | "failed"
+  const [size, setSize] = useState({ w: 0, h: 0 });
+  const [landscape, setLandscape] = useState(false);
+  const [flash, setFlash] = useState(false);
+  const [shots, setShots] = useState(0);
+  const [lastShot, setLastShot] = useState(null);
+
+  const TOP = 84;
+  const BOTTOM = 170;
+  const PAGE_RATIO = 1.414; // A4 long side / short side
+
+  useEffect(() => {
+    let cancelled = false;
+    async function start() {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setError("failed");
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+          audio: false,
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        streamRef.current = stream;
+        // Continuous autofocus where the device supports it (best-effort).
+        try {
+          const track = stream.getVideoTracks()[0];
+          await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+        } catch (_) {}
+        const v = videoRef.current;
+        if (v) {
+          v.srcObject = stream;
+          await v.play().catch(() => {});
+        }
+        setReady(true);
+      } catch (e) {
+        if (!cancelled) setError(e && (e.name === "NotAllowedError" || e.name === "SecurityError") ? "denied" : "failed");
+      }
+    }
+    start();
+    return () => {
+      cancelled = true;
+      if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const measure = () => setSize({ w: el.clientWidth, h: el.clientHeight });
+    measure();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+    if (ro) ro.observe(el);
+    window.addEventListener("resize", measure);
+    return () => {
+      if (ro) ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+
+  // The scan frame, in wrapper (screen) pixels.
+  const frame = useMemo(() => {
+    const availW = Math.max(0, size.w - 32);
+    const availH = Math.max(0, size.h - TOP - BOTTOM);
+    let fw, fh;
+    if (landscape) {
+      fw = Math.min(availW, availH * PAGE_RATIO);
+      fh = fw / PAGE_RATIO;
+    } else {
+      fh = Math.min(availH, availW * PAGE_RATIO);
+      fw = fh / PAGE_RATIO;
+    }
+    return { x: (size.w - fw) / 2, y: TOP + (availH - fh) / 2, w: fw, h: fh };
+  }, [size, landscape]);
+
+  function capture() {
+    const v = videoRef.current;
+    if (!v || !v.videoWidth || !frame.w) return;
+    const vw = v.videoWidth, vh = v.videoHeight;
+    // The <video> is drawn object-fit: cover — map the on-screen frame back
+    // to source-video pixels so the saved photo is exactly the framed area.
+    const s = Math.max(size.w / vw, size.h / vh);
+    const ox = (size.w - vw * s) / 2;
+    const oy = (size.h - vh * s) / 2;
+    let sx = (frame.x - ox) / s;
+    let sy = (frame.y - oy) / s;
+    let sw = frame.w / s;
+    let sh = frame.h / s;
+    sx = Math.max(0, sx);
+    sy = Math.max(0, sy);
+    sw = Math.min(sw, vw - sx);
+    sh = Math.min(sh, vh - sy);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(sw);
+    canvas.height = Math.round(sh);
+    canvas.getContext("2d").drawImage(v, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+    onCapture(dataUrl);
+    setShots((n) => n + 1);
+    setLastShot(dataUrl);
+    setFlash(true);
+    setTimeout(() => setFlash(false), 120);
+  }
+
+  const corner = (pos) => {
+    const base = { position: "absolute", width: 26, height: 26, borderColor: "#fff", borderStyle: "solid", borderWidth: 0 };
+    const map = {
+      tl: { top: -2, left: -2, borderTopWidth: 4, borderLeftWidth: 4, borderTopLeftRadius: 8 },
+      tr: { top: -2, right: -2, borderTopWidth: 4, borderRightWidth: 4, borderTopRightRadius: 8 },
+      bl: { bottom: -2, left: -2, borderBottomWidth: 4, borderLeftWidth: 4, borderBottomLeftRadius: 8 },
+      br: { bottom: -2, right: -2, borderBottomWidth: 4, borderRightWidth: 4, borderBottomRightRadius: 8 },
+    };
+    return <div key={pos} style={{ ...base, ...map[pos] }} />;
+  };
+
+  const roundBtn = {
+    width: 44,
+    height: 44,
+    borderRadius: "50%",
+    border: "none",
+    background: "rgba(255,255,255,0.18)",
+    color: "#fff",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 0,
+  };
+
+  return (
+    <div
+      ref={wrapRef}
+      onClick={(e) => e.stopPropagation()}
+      style={{ position: "fixed", inset: 0, zIndex: 120, background: "#000", overflow: "hidden", touchAction: "none" }}
+    >
+      <video
+        ref={videoRef}
+        playsInline
+        muted
+        autoPlay
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }}
+      />
+
+      {ready && frame.w > 0 && (
+        <div
+          style={{
+            position: "absolute",
+            left: frame.x,
+            top: frame.y,
+            width: frame.w,
+            height: frame.h,
+            borderRadius: 10,
+            border: "1.5px solid rgba(255,255,255,0.55)",
+            boxShadow: "0 0 0 100vmax rgba(0,0,0,0.58)", // dims everything outside the page frame
+            pointerEvents: "none",
+          }}
+        >
+          {["tl", "tr", "bl", "br"].map(corner)}
+        </div>
+      )}
+
+      {flash && <div style={{ position: "absolute", inset: 0, background: "#fff", opacity: 0.6, pointerEvents: "none" }} />}
+
+      {/* Top bar */}
+      <div
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          right: 0,
+          paddingTop: "calc(env(safe-area-inset-top, 0px) + 12px)",
+          paddingLeft: 16,
+          paddingRight: 16,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          color: "#fff",
+        }}
+      >
+        <button onClick={onClose} title="סגירה" style={roundBtn}>
+          <AppIcon name="X" size={20} color="#fff" />
+        </button>
+        <div style={{ fontSize: 14, fontWeight: 600, textShadow: "0 1px 4px rgba(0,0,0,0.6)" }}>{title}</div>
+        <button onClick={() => setLandscape((l) => !l)} title="החלפת כיוון המסגרת (לאורך / לרוחב)" style={roundBtn}>
+          <AppIcon name="RotateCw" size={19} color="#fff" />
+        </button>
+      </div>
+
+      {/* Hint */}
+      {ready && !error && (
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: `calc(env(safe-area-inset-bottom, 0px) + ${BOTTOM - 8}px)`,
+            textAlign: "center",
+            color: "#fff",
+            fontSize: 13,
+            textShadow: "0 1px 4px rgba(0,0,0,0.7)",
+            padding: "0 24px",
+          }}
+        >
+          יישרו את העמוד בתוך המסגרת — רק מה שבפנים ייסרק
+        </div>
+      )}
+
+      {/* Bottom controls */}
+      <div
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          bottom: 0,
+          paddingBottom: "calc(env(safe-area-inset-bottom, 0px) + 22px)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          paddingLeft: 24,
+          paddingRight: 24,
+        }}
+      >
+        <div style={{ width: 64, height: 64, position: "relative" }}>
+          {lastShot && (
+            <>
+              <img
+                src={lastShot}
+                alt="העמוד האחרון שנסרק"
+                style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 8, border: "2px solid #fff" }}
+              />
+              <div
+                style={{
+                  position: "absolute",
+                  top: -6,
+                  right: 2,
+                  minWidth: 20,
+                  height: 20,
+                  borderRadius: 10,
+                  background: "#3E7C74",
+                  color: "#fff",
+                  fontSize: 11.5,
+                  fontWeight: 700,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  padding: "0 5px",
+                }}
+              >
+                {shots}
+              </div>
+            </>
+          )}
+        </div>
+
+        <button
+          onClick={capture}
+          disabled={!ready}
+          title="צילום"
+          style={{
+            width: 72,
+            height: 72,
+            borderRadius: "50%",
+            border: "4px solid #fff",
+            background: ready ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.3)",
+            boxShadow: "inset 0 0 0 4px #000",
+            cursor: ready ? "pointer" : "default",
+            padding: 0,
+          }}
+        />
+
+        <div style={{ width: 64, display: "flex", justifyContent: "flex-end" }}>
+          {shots > 0 && (
+            <button
+              onClick={onClose}
+              style={{
+                border: "none",
+                background: "#3E7C74",
+                color: "#fff",
+                borderRadius: 22,
+                padding: "10px 16px",
+                fontSize: 13.5,
+                fontWeight: 700,
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
+              }}
+            >
+              <AppIcon name="Check" size={15} color="#fff" />
+              סיום
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Camera unavailable → offer the classic camera */}
+      {error && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 14,
+            padding: 32,
+            textAlign: "center",
+            color: "#fff",
+            background: "rgba(0,0,0,0.85)",
+          }}
+        >
+          <div style={{ fontSize: 15, lineHeight: 1.6, maxWidth: 320 }}>
+            {error === "denied"
+              ? "אין הרשאה לשימוש במצלמה. אפשר לאשר גישה למצלמה בהגדרות הדפדפן, או להשתמש במצלמה הרגילה."
+              : "לא הצלחנו לפתוח את מצלמת הסריקה במכשיר הזה. אפשר להשתמש במצלמה הרגילה."}
+          </div>
+          <button
+            onClick={onFallback}
+            style={{ border: "none", background: "#3E7C74", color: "#fff", borderRadius: 12, padding: "11px 20px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}
+          >
+            פתיחת מצלמה רגילה
+          </button>
+          <button
+            onClick={onClose}
+            style={{ border: "none", background: "none", color: "#cfd8d3", fontSize: 13.5, cursor: "pointer" }}
+          >
+            ביטול
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Camera-scan import modal — photograph pages of a printed book, group the
+// photos into chapters, and have the English text read off each photo
+// on-device (Tesseract.js — see the script tag in <head>) and typed in
+// exactly as printed, no rewrite. Deliberately mirrors ArticleImportModal's
+// "no public/private toggle at all" UI (a scanned book is always private —
+// see storyIsPublic's hardcoded scanImport check) while still allowing
+// print, unlike that one.
+function ScanImportModal({ onClose, onImport }) {
+  const [bookTitle, setBookTitle] = useState("");
+  // Each entry is one chapter-in-progress: { id, title, images: [{ id, dataUrl }] }
+  const [chapters, setChapters] = useState(() => [{ id: uid(), title: "", images: [] }]);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState("");
+  const [err, setErr] = useState(null);
+  const inputRef = useRef(null);
+  const captureGroupId = useRef(null);
+  const [scannerOpen, setScannerOpen] = useState(false);
+
+  const totalPhotos = chapters.reduce((n, g) => n + g.images.length, 0);
+
+  // Opens the framed page-scan camera (CameraScanner). The classic camera
+  // input below is kept only as a fallback if the live camera is unavailable.
+  function openCameraFor(groupId) {
+    if (busy) return;
+    captureGroupId.current = groupId;
+    setScannerOpen(true);
+  }
+
+  function openClassicCamera() {
+    setScannerOpen(false);
+    if (inputRef.current) {
+      inputRef.current.value = ""; // lets the same file/shot be picked again in a row
+      inputRef.current.click();
+    }
+  }
+
+  function handleScannerCapture(dataUrl) {
+    const groupId = captureGroupId.current;
+    if (!groupId) return;
+    setChapters((prev) => prev.map((g) => (g.id === groupId ? { ...g, images: [...g.images, { id: uid(), dataUrl }] } : g)));
+  }
+
+  function fileToDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error("קריאת התמונה נכשלה."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function handleFilesChosen(e) {
+    const files = Array.from(e.target.files || []);
+    const groupId = captureGroupId.current;
+    if (!files.length || !groupId) return;
+    try {
+      const newImages = await Promise.all(files.map(async (f) => ({ id: uid(), dataUrl: await fileToDataUrl(f) })));
+      setChapters((prev) => prev.map((g) => (g.id === groupId ? { ...g, images: [...g.images, ...newImages] } : g)));
+    } catch (e2) {
+      setErr(e2.message || "שגיאה בטעינת התמונה.");
+    }
+  }
+
+  function addChapter() {
+    if (busy) return;
+    setChapters((prev) => [...prev, { id: uid(), title: "", images: [] }]);
+  }
+
+  function removeChapter(groupId) {
+    if (busy) return;
+    setChapters((prev) => (prev.length <= 1 ? prev : prev.filter((g) => g.id !== groupId)));
+  }
+
+  function removeImage(groupId, imageId) {
+    if (busy) return;
+    setChapters((prev) => prev.map((g) => (g.id === groupId ? { ...g, images: g.images.filter((im) => im.id !== imageId) } : g)));
+  }
+
+  function renameChapter(groupId, title) {
+    setChapters((prev) => prev.map((g) => (g.id === groupId ? { ...g, title } : g)));
+  }
+
+  async function handleImport() {
+    if (busy || !totalPhotos) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await onImport(bookTitle, chapters, (msg) => setProgress(msg));
+    } catch (e) {
+      setErr(e.message || "שגיאה לא ידועה");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(35,52,46,0.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 90,
+        padding: 20,
+      }}
+      onClick={() => !busy && onClose()}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "var(--paper)",
+          borderRadius: 16,
+          padding: 24,
+          maxWidth: 480,
+          width: "100%",
+          maxHeight: "88vh",
+          overflowY: "auto",
+          boxShadow: "0 20px 50px rgba(0,0,0,0.25)",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+          <div style={{ fontFamily: "'Frank Ruhl Libre', serif", fontSize: 18, fontWeight: 700 }}>ייבוא ספר מסריקת מצלמה</div>
+          {!busy && (
+            <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--ink)" }}>
+              <AppIcon name="X" size={18} />
+            </button>
+          )}
+        </div>
+        <div style={{ fontSize: 13.5, color: "#5c665f", marginBottom: 16, lineHeight: 1.6 }}>
+          צלמו את עמודי הספר באנגלית, עמוד אחר עמוד. הטקסט יזוהה אוטומטית מהתמונה ויוקלד בדיוק כמו שהוא — בלי שכתוב
+          או שינוי, כולל זיהוי עמודות, כותרות, רשימות וטבלאות. אפשר לחלק את העמודים לכמה פרקים. הספר יישמר פרטי בלבד (אי אפשר להפוך אותו לציבורי), אבל כן אפשר
+          להדפיס אותו כמו כל ספר אחר.
+        </div>
+
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          onChange={handleFilesChosen}
+          style={{ display: "none" }}
+        />
+
+        {scannerOpen && (
+          <CameraScanner
+            title="סריקת עמוד לספר"
+            onCapture={handleScannerCapture}
+            onClose={() => setScannerOpen(false)}
+            onFallback={openClassicCamera}
+          />
+        )}
+
+        <input
+          type="text"
+          value={bookTitle}
+          onChange={(e) => setBookTitle(e.target.value)}
+          disabled={busy}
+          placeholder="שם הספר"
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "1.5px solid var(--line-strong)",
+            fontSize: 14,
+            marginBottom: 16,
+            fontFamily: "inherit",
+            background: busy ? "var(--paper-raised)" : "var(--paper)",
+          }}
+        />
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 14 }}>
+          {chapters.map((group, gi) => (
+            <div
+              key={group.id}
+              style={{
+                border: "1px solid var(--line)",
+                borderRadius: 12,
+                padding: 12,
+                background: "var(--paper-raised)",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <input
+                  type="text"
+                  value={group.title}
+                  onChange={(e) => renameChapter(group.id, e.target.value)}
+                  disabled={busy}
+                  placeholder={`פרק ${gi + 1}`}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    padding: "6px 9px",
+                    borderRadius: 8,
+                    border: "1px solid var(--line-strong)",
+                    fontSize: 13,
+                    fontFamily: "inherit",
+                    background: "var(--paper)",
+                  }}
+                />
+                {chapters.length > 1 && !busy && (
+                  <button
+                    onClick={() => removeChapter(group.id)}
+                    title="מחיקת הפרק"
+                    style={{ border: "none", background: "none", cursor: "pointer", color: "#8a9089", padding: 4 }}
+                  >
+                    <AppIcon name="Trash2" size={16} />
+                  </button>
+                )}
+              </div>
+
+              {group.images.length > 0 && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+                  {group.images.map((img, ii) => (
+                    <div key={img.id} style={{ position: "relative", width: 56, height: 56 }}>
+                      <img
+                        src={img.dataUrl}
+                        alt={`עמוד ${ii + 1}`}
+                        style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 8, border: "1px solid var(--line)" }}
+                      />
+                      {!busy && (
+                        <button
+                          onClick={() => removeImage(group.id, img.id)}
+                          title="מחיקת העמוד"
+                          style={{
+                            position: "absolute",
+                            top: -6,
+                            right: -6,
+                            width: 18,
+                            height: 18,
+                            borderRadius: "50%",
+                            border: "none",
+                            background: "#8B3A3A",
+                            color: "#fff",
+                            cursor: "pointer",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            padding: 0,
+                          }}
+                        >
+                          <AppIcon name="X" size={11} color="#fff" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <SecondaryButton onClick={() => openCameraFor(group.id)} disabled={busy} style={{ padding: "7px 12px", fontSize: 12.5, width: "100%" }}>
+                <AppIcon name="Camera" size={14} />
+                {group.images.length ? "צילום עמוד נוסף בפרק הזה" : "צילום עמוד ראשון"}
+              </SecondaryButton>
+            </div>
+          ))}
+        </div>
+
+        {!busy && (
+          <SecondaryButton onClick={addChapter} style={{ padding: "8px 12px", fontSize: 12.5, width: "100%", marginBottom: 16 }}>
+            <AppIcon name="Plus" size={14} />
+            פרק חדש
+          </SecondaryButton>
+        )}
+
+        {busy && (
+          <div style={{ fontSize: 12.5, color: "#5c665f", marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 16, height: 16, borderRadius: "50%", border: "2.5px solid #3E7C7440", borderTopColor: "#3E7C74", animation: "spin 0.8s linear infinite" }} />
+            {progress || "מעבדים…"}
+          </div>
+        )}
+        {err && <div style={{ fontSize: 12.5, color: "#8B3A3A", marginBottom: 12, lineHeight: 1.5 }}>{err}</div>}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <PrimaryButton onClick={handleImport} disabled={!totalPhotos || busy} style={{ width: "100%", padding: "10px 0", fontSize: 13.5 }}>
+            {busy ? "מזהים טקסט…" : `ייבאו את הספר (${totalPhotos.toLocaleString("he")} עמודים)`}
+          </PrimaryButton>
+          {!busy && (
+            <SecondaryButton onClick={onClose} style={{ width: "100%", padding: "10px 0", fontSize: 13.5 }}>
+              ביטול
+            </SecondaryButton>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Single-continuous-text camera-scan modal — a flat list of photos (no
+// chapter grouping, unlike ScanImportModal above), whose recognized text is
+// stitched into ONE piece of text on import. Meant for a quick scan-to-
+// translate/read of a worksheet, sign, or short passage — not a whole book.
+function ScanTextImportModal({ onClose, onImport }) {
+  const [label, setLabel] = useState("");
+  const [images, setImages] = useState([]); // [{ id, dataUrl }]
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState("");
+  const [err, setErr] = useState(null);
+  const inputRef = useRef(null);
+  const [scannerOpen, setScannerOpen] = useState(false);
+
+  // Opens the framed page-scan camera (CameraScanner). The classic camera
+  // input below is kept only as a fallback if the live camera is unavailable.
+  function openCamera() {
+    if (busy) return;
+    setScannerOpen(true);
+  }
+
+  function openClassicCamera() {
+    setScannerOpen(false);
+    if (inputRef.current) {
+      inputRef.current.value = ""; // lets the same shot be picked again in a row
+      inputRef.current.click();
+    }
+  }
+
+  function handleScannerCapture(dataUrl) {
+    setImages((prev) => [...prev, { id: uid(), dataUrl }]);
+  }
+
+  function fileToDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error("קריאת התמונה נכשלה."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function handleFilesChosen(e) {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    try {
+      const newImages = await Promise.all(files.map(async (f) => ({ id: uid(), dataUrl: await fileToDataUrl(f) })));
+      setImages((prev) => [...prev, ...newImages]);
+    } catch (e2) {
+      setErr(e2.message || "שגיאה בטעינת התמונה.");
+    }
+  }
+
+  function removeImage(id) {
+    if (busy) return;
+    setImages((prev) => prev.filter((im) => im.id !== id));
+  }
+
+  async function handleImport() {
+    if (busy || !images.length) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await onImport(label, images, (msg) => setProgress(msg));
+    } catch (e) {
+      setErr(e.message || "שגיאה לא ידועה");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(35,52,46,0.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 90,
+        padding: 20,
+      }}
+      onClick={() => !busy && onClose()}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "var(--paper)",
+          borderRadius: 16,
+          padding: 24,
+          maxWidth: 460,
+          width: "100%",
+          maxHeight: "88vh",
+          overflowY: "auto",
+          boxShadow: "0 20px 50px rgba(0,0,0,0.25)",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+          <div style={{ fontFamily: "'Frank Ruhl Libre', serif", fontSize: 18, fontWeight: 700 }}>סריקת טקסט מהמצלמה</div>
+          {!busy && (
+            <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--ink)" }}>
+              <AppIcon name="X" size={18} />
+            </button>
+          )}
+        </div>
+        <div style={{ fontSize: 13.5, color: "#5c665f", marginBottom: 16, lineHeight: 1.6 }}>
+          צלמו תמונה אחת או כמה תמונות של טקסט באנגלית. הטקסט מכולן יזוהה ויתחבר לקטע קריאה רציף אחד — בלי חלוקה
+          לפרקים ובלי להיחשב "ספר" — בדיוק כמו שהוא, בלי שכתוב. מבנה העמוד מזוהה: עמודות נקראות עמודה אחרי עמודה,
+          וכותרות, רשימות וטבלאות נשמרות בנפרד. הקטע יישמר פרטי בלבד, אבל אפשר להדפיס אותו.
+        </div>
+
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          onChange={handleFilesChosen}
+          style={{ display: "none" }}
+        />
+
+        {scannerOpen && (
+          <CameraScanner
+            title="סריקת טקסט"
+            onCapture={handleScannerCapture}
+            onClose={() => setScannerOpen(false)}
+            onFallback={openClassicCamera}
+          />
+        )}
+
+        <input
+          type="text"
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+          disabled={busy}
+          placeholder="שם לקטע (לא חובה)"
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "1.5px solid var(--line-strong)",
+            fontSize: 14,
+            marginBottom: 14,
+            fontFamily: "inherit",
+            background: busy ? "var(--paper-raised)" : "var(--paper)",
+          }}
+        />
+
+        {images.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
+            {images.map((img, ii) => (
+              <div key={img.id} style={{ position: "relative", width: 56, height: 56 }}>
+                <img
+                  src={img.dataUrl}
+                  alt={`תמונה ${ii + 1}`}
+                  style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 8, border: "1px solid var(--line)" }}
+                />
+                {!busy && (
+                  <button
+                    onClick={() => removeImage(img.id)}
+                    title="מחיקת התמונה"
+                    style={{
+                      position: "absolute",
+                      top: -6,
+                      right: -6,
+                      width: 18,
+                      height: 18,
+                      borderRadius: "50%",
+                      border: "none",
+                      background: "#8B3A3A",
+                      color: "#fff",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      padding: 0,
+                    }}
+                  >
+                    <AppIcon name="X" size={11} color="#fff" />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!busy && (
+          <SecondaryButton onClick={openCamera} style={{ padding: "9px 12px", fontSize: 13, width: "100%", marginBottom: 14 }}>
+            <AppIcon name="Camera" size={15} />
+            {images.length ? "צילום תמונה נוספת" : "צילום תמונה"}
+          </SecondaryButton>
+        )}
+
+        {busy && (
+          <div style={{ fontSize: 12.5, color: "#5c665f", marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 16, height: 16, borderRadius: "50%", border: "2.5px solid #3E7C7440", borderTopColor: "#3E7C74", animation: "spin 0.8s linear infinite" }} />
+            {progress || "מעבדים…"}
+          </div>
+        )}
+        {err && <div style={{ fontSize: 12.5, color: "#8B3A3A", marginBottom: 12, lineHeight: 1.5 }}>{err}</div>}
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <PrimaryButton onClick={handleImport} disabled={!images.length || busy} style={{ width: "100%", padding: "10px 0", fontSize: 13.5 }}>
+            {busy ? "מזהים טקסט…" : `ייבאו את הטקסט (${images.length.toLocaleString("he")} תמונות)`}
+          </PrimaryButton>
+          {!busy && (
+            <SecondaryButton onClick={onClose} style={{ width: "100%", padding: "10px 0", fontSize: 13.5 }}>
+              ביטול
+            </SecondaryButton>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 // Browse-everyone's-books page: category chips (same categories as the rest
 // of the app, plus the two virtual ones) across the top, and — once a
@@ -14784,7 +17560,7 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
   const chapter = chapterAt(story, chapterIndex) || { title: "", content: "", image: null, imageStatus: "none" };
   const hasNextSlot = chapterIndex + 1 < story.totalChapters;
   const atStoryEnd = !hasNextSlot;
-  const isSearchStory = story.categoryId === "search" || story.categoryId === "pdfImport" || story.categoryId === "webImport";
+  const isSearchStory = story.categoryId === "search" || story.categoryId === "pdfImport" || story.categoryId === "webImport" || story.categoryId === "scanImport" || story.categoryId === "scanText";
   const Icon = category.icon;
   const dropCapColor = dropCapColorFor(story, prefs.background, category.color);
   const imageAbove = true; // the chapter image always appears at the start of the chapter — in both pagination and continuous-scroll modes
@@ -18135,7 +20911,7 @@ function LibraryView({ state, setState, onOpen, onRequestDelete }) {
   // Always show every topic as a filter option — including ones with no
   // books yet — rather than only topics some story already exists in, so
   // the filter row doesn't reshuffle/disappear options as the library grows.
-  const topicOptions = useMemo(() => [...CATEGORIES, SEARCH_CATEGORY, PDF_IMPORT_CATEGORY, ARTICLE_IMPORT_CATEGORY], []);
+  const topicOptions = useMemo(() => [...CATEGORIES, SEARCH_CATEGORY, PDF_IMPORT_CATEGORY, ARTICLE_IMPORT_CATEGORY, SCAN_IMPORT_CATEGORY, SCAN_TEXT_CATEGORY], []);
 
   const stories = allStories.filter((s) => {
     if (sortMode === "size") {
@@ -18278,15 +21054,15 @@ function LibraryView({ state, setState, onOpen, onRequestDelete }) {
           ) : (
             <>
               {(() => {
-                // "מאמר מקישור" (webImport) stories are always private (see
-                // storyIsPublic) — pairing that category with "ציבורי" can
-                // only ever produce zero results, which is exactly the
-                // confusing empty-list case this is meant to prevent. So
-                // while that category is the active topic filter, "ציבורי"
-                // is locked out and "פרטי" is locked on. The lock releases
-                // the moment a different topic chip (including "הכל") is
-                // chosen.
-                const webImportLocked = topicFilter === "webImport";
+                // "מאמר מקישור" (webImport) and "ספר מסריקה" (scanImport)
+                // stories are always private (see storyIsPublic) — pairing
+                // either category with "ציבורי" can only ever produce zero
+                // results, which is exactly the confusing empty-list case
+                // this is meant to prevent. So while one of those categories
+                // is the active topic filter, "ציבורי" is locked out and
+                // "פרטי" is locked on. The lock releases the moment a
+                // different topic chip (including "הכל") is chosen.
+                const webImportLocked = topicFilter === "webImport" || topicFilter === "scanImport" || topicFilter === "scanText";
                 // "הכל" here means "no filtering at all" — both category
                 // and visibility wide open — not just "any category". So
                 // selecting it also clears any active פרטי/ציבורי, and it
@@ -18361,7 +21137,7 @@ function LibraryView({ state, setState, onOpen, onRequestDelete }) {
                         key={c.id}
                         onClick={() =>
                           updateLibrarySort(
-                            c.id === "webImport"
+                            c.id === "webImport" || c.id === "scanImport" || c.id === "scanText"
                               ? { topicFilter: c.id, visFilter: "private" }
                               : { topicFilter: c.id }
                           )
@@ -18675,7 +21451,13 @@ function GrammarReferenceView({ state }) {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+// Second, independent check right before mount: even if the domain-lock
+// <script> above this one were somehow stripped out of a copied page,
+// this still refuses to boot the app on an unauthorized domain (it just
+// won't have the friendly blocked-message styling in that case).
+if (!window.__APP_DOMAIN_LOCKED__) {
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+}
   </script>
 
   <script>

@@ -1,5 +1,10 @@
 // netlify/functions/fetch-article.js
 //
+// © 2026 Yonatan Eliyahu Lifshitz. All rights reserved. / © 2026 יונתן אליהו ליפשיץ. כל הזכויות שמורות.
+// Provided "AS-IS" for personal use only. No part of this file may be
+// reproduced, distributed, or used for any commercial or other purpose
+// without the prior written permission of the copyright owner.
+//
 // Server-side fetch proxy for the "ייבוא כתבה מקישור" (import article from
 // link) feature in index.html.
 //
