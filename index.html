@@ -3066,7 +3066,7 @@ async function identityForProject(registryIdentity, targetConfig, onProgress, in
 
 // TODO: fill in with the real backend URL once deployed (see INTEGRATION.md) —
 // e.g. "https://english-books-backend.onrender.com"
-const BACKGROUND_JOBS_BACKEND_URL = "";
+const BACKGROUND_JOBS_BACKEND_URL = "https://english-books-backend.onrender.com";
 
 // Gathers this device's provider settings (keys/models/custom Base URLs) in
 // the exact shape backend/generation/providerClients.js expects — same
@@ -3134,7 +3134,7 @@ async function enableBackgroundGenerationNotifications() {
   const permission = await Notification.requestPermission();
   if (permission !== "granted") throw new Error("לא ניתנה הרשאה להתראות.");
 
-  const vapidPublicKey = ""; // TODO: paste the VAPID_PUBLIC_KEY from the backend's .env here (it's meant to be public)
+  const vapidPublicKey = "BNxg1-2Lc1RehM01VWGa6lsOhMD7Ypum1U07G5Se5wJsCakYWG3cOLYeQ-e5WAWmHQ7nLqQF4GAUTBh7rZMYRh8 "; // TODO: paste the VAPID_PUBLIC_KEY from the backend's .env here (it's meant to be public)
   const subscription = await reg.pushManager.subscribe({
     userVisibleOnly: true,
     applicationServerKey: vapidPublicKey,
