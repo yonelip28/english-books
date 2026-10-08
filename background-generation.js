@@ -25,7 +25,7 @@
 
 // TODO: fill in with the real backend URL once deployed (see INTEGRATION.md) —
 // e.g. "https://english-books-backend.onrender.com"
-const BACKGROUND_JOBS_BACKEND_URL = "";const BACKGROUND_JOBS_BACKEND_URL = "https://english-books-backend.onrender.com";
+const BACKGROUND_JOBS_BACKEND_URL = "https://english-books-backend.onrender.com";
 // Gathers this device's provider settings (keys/models/custom Base URLs) in
 // the exact shape backend/generation/providerClients.js expects — same
 // FALLBACK_CHAIN_ORDER, same per-provider fields.
