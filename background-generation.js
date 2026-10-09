@@ -26,6 +26,7 @@
 // TODO: fill in with the real backend URL once deployed (see INTEGRATION.md) —
 // e.g. "https://english-books-backend.onrender.com"
 const BACKGROUND_JOBS_BACKEND_URL = "https://english-books-backend.onrender.com";
+
 // Gathers this device's provider settings (keys/models/custom Base URLs) in
 // the exact shape backend/generation/providerClients.js expects — same
 // FALLBACK_CHAIN_ORDER, same per-provider fields.
@@ -80,6 +81,16 @@ async function startBackgroundBookGeneration({ category, level, avoidTopics, for
   return res.json(); // { jobId, targetProjectId }
 }
 
+// Web Push needs the VAPID key as bytes, not as a base64url string.
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
 // Registers this device for Web Push notifications ("your book is ready")
 // and tells the backend about it. Call from a button tap (permission
 // prompts require a user gesture), not automatically on page load.
@@ -92,19 +103,61 @@ async function enableBackgroundGenerationNotifications() {
   const permission = await Notification.requestPermission();
   if (permission !== "granted") throw new Error("לא ניתנה הרשאה להתראות.");
 
-  const vapidPublicKey = "BNxg1-2Lc1RehM01VWGa6lsOhMD7Ypum1U07G5Se5wJsCakYWG3cOLYeQ-e5WAWmHQ7nLqQF4GAUTBh7rZMYRh8 "; // TODO: paste the VAPID_PUBLIC_KEY from the backend's .env here (it's meant to be public)
-  const subscription = await reg.pushManager.subscribe({
-    userVisibleOnly: true,
-    applicationServerKey: vapidPublicKey,
-  });
+  const vapidPublicKey = "BNxg1-2Lc1RehM01VWGa6lsOhMD7Ypum1U07G5Se5wJsCakYWG3cOLYeQ-e5WAWmHQ7nLqQF4GAUTBh7rZMYRh8"; // TODO: paste the VAPID_PUBLIC_KEY from the backend's .env here (it's meant to be public)
+  if (!vapidPublicKey) throw new Error("חסר מפתח VAPID ציבורי בקוד (background-generation.js).");
+  await navigator.serviceWorker.ready;
+  const subscription = (await reg.pushManager.getSubscription()) ||
+    (await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
+    }));
 
   const registryIdentity = await ensureGoogleSignedIn(null, true);
   const email = registryIdentity.email || getCloudEmail();
-  await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/push/subscribe`, {
+  const subRes = await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/push/subscribe`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ userId: hashEmailToDocId(email), subscription }),
   });
+  if (!subRes.ok) throw new Error(`השרת לא קיבל את ההרשמה להתראות (${subRes.status}).`);
+}
+
+// Finds this device's existing push subscription (if any) — only looks at
+// the push-sw.js worker, so it never confuses it with anything else.
+async function getPushSubscription() {
+  if (!("serviceWorker" in navigator)) return null;
+  const regs = await navigator.serviceWorker.getRegistrations();
+  const reg = regs.find((r) => {
+    const w = r.active || r.waiting || r.installing;
+    return w && w.scriptURL.endsWith("/push-sw.js");
+  });
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+
+// Turns notifications off for THIS device: drops the browser subscription
+// (so nothing can be delivered here anymore) and tells the backend to
+// forget it. The browser's own permission stays "granted" — web pages
+// can't revoke that themselves — so turning notifications back on later
+// is instant, with no new permission prompt.
+async function disableBackgroundGenerationNotifications() {
+  const sub = await getPushSubscription();
+  if (!sub) return;
+  const endpoint = sub.endpoint;
+  await sub.unsubscribe();
+  try {
+    if (BACKGROUND_JOBS_BACKEND_URL) {
+      const email = getCloudEmail();
+      await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/push/unsubscribe`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId: email ? hashEmailToDocId(email) : null, endpoint }),
+      });
+    }
+  } catch (e) {
+    // Best effort: if the server doesn't hear about it, it will drop the
+    // dead subscription itself on the next failed (410) send.
+    console.warn("Could not notify backend about unsubscribe:", e);
+  }
 }
 
 // Lets the reader turn on Web Push notifications for background book
@@ -115,13 +168,33 @@ async function enableBackgroundGenerationNotifications() {
 function BackgroundNotificationsPanel({ state }) {
   const [status, setStatus] = React.useState(null); // null | "working" | "done" | { error }
 
-  const alreadyGranted = typeof Notification !== "undefined" && Notification.permission === "granted";
+  const [subscribed, setSubscribed] = React.useState(null); // null = checking | true | false
+
+  React.useEffect(() => {
+    let cancelled = false;
+    getPushSubscription()
+      .then((sub) => { if (!cancelled) setSubscribed(!!sub); })
+      .catch(() => { if (!cancelled) setSubscribed(false); });
+    return () => { cancelled = true; };
+  }, []);
 
   async function handleEnable() {
     setStatus("working");
     try {
       await enableBackgroundGenerationNotifications();
+      setSubscribed(true);
       setStatus("done");
+    } catch (e) {
+      setStatus({ error: e.message || "משהו השתבש." });
+    }
+  }
+
+  async function handleDisable() {
+    setStatus("working");
+    try {
+      await disableBackgroundGenerationNotifications();
+      setSubscribed(false);
+      setStatus("disabled");
     } catch (e) {
       setStatus({ error: e.message || "משהו השתבש." });
     }
@@ -150,20 +223,31 @@ function BackgroundNotificationsPanel({ state }) {
       <div style={{ fontSize: 11, color: "#7a847d", marginBottom: 8, lineHeight: 1.5 }}>
         הפעלה חד-פעמית בכל מכשיר. באייפון צריך קודם להוסיף את האפליקציה למסך הבית.
       </div>
-      {typeof Notification !== "undefined" && Notification.permission === "denied" && status !== "done" ? (
+      {typeof Notification !== "undefined" && Notification.permission === "denied" && !subscribed ? (
         <div style={{ fontSize: 12, color: "#8B3A3A", lineHeight: 1.5 }}>
           ההתראות חסומות במכשיר הזה. כדי להפעיל: הגדרות הדפדפן/האתר ← התראות ← אפשר, ואז חזרו לכאן.
         </div>
-      ) : alreadyGranted && status !== "done" ? (
-        <div style={{ fontSize: 12, color: "#3E7C74", fontWeight: 700 }}>✓ הרשאת התראות כבר אושרה במכשיר הזה</div>
+      ) : subscribed ? (
+        <div>
+          <div style={{ fontSize: 12, color: "#3E7C74", fontWeight: 700, marginBottom: 8 }}>
+            ✓ התראות פעילות במכשיר הזה
+          </div>
+          <SecondaryButton onClick={handleDisable} disabled={status === "working"}>
+            {status === "working" ? <AppIcon name="Loader2" className="spin" size={14} /> : null}
+            ביטול התראות
+          </SecondaryButton>
+        </div>
       ) : (
-        <SecondaryButton onClick={handleEnable} disabled={status === "working"}>
+        <SecondaryButton onClick={handleEnable} disabled={status === "working" || subscribed === null}>
           {status === "working" ? <AppIcon name="Loader2" className="spin" size={14} /> : null}
           הפעלת התראות
         </SecondaryButton>
       )}
       {status === "done" && (
         <div style={{ fontSize: 12, color: "#3E7C74", marginTop: 6, fontWeight: 700 }}>✓ ההתראות הופעלו בהצלחה</div>
+      )}
+      {status === "disabled" && (
+        <div style={{ fontSize: 12, color: "#5c665f", marginTop: 6, fontWeight: 700 }}>ההתראות בוטלו במכשיר הזה. אפשר להפעיל שוב בכל עת.</div>
       )}
       {status && status.error && (
         <div style={{ fontSize: 12, color: "#8B3A3A", marginTop: 6 }}>{status.error}</div>

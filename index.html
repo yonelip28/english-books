@@ -1221,9 +1221,12 @@ function recordTokenUse(id, n) {
 }
 // How many milliseconds until this provider can take a request of `need`
 // tokens: 0 = ready now.
-function providerWaitMs(id, need, now = Date.now()) {
+// `reserve` (0..1) holds back that share of the provider's per-minute token
+// limit, so background book generation never uses 100% of it and a word
+// translation always has headroom to go through at once.
+function providerWaitMs(id, need, now = Date.now(), reserve = 0) {
   let wait = Math.max(0, (PROVIDER_BLOCKED_UNTIL[id] || 0) - now);
-  const limit = PROVIDER_TPM_LIMIT[id];
+  const limit = PROVIDER_TPM_LIMIT[id] && PROVIDER_TPM_LIMIT[id] * (1 - reserve);
   if (limit && need <= limit) {
     const led = (TOKEN_LEDGER[id] = (TOKEN_LEDGER[id] || []).filter((x) => now - x.t < 60000));
     const used = led.reduce((a, x) => a + x.n, 0);
@@ -1239,6 +1242,17 @@ function providerWaitMs(id, need, now = Date.now()) {
     }
   }
   return wait;
+}
+// Word/sentence translation is tiny, so it never queues behind background
+// generation's token ledger or a long "rate limited until" mark: a provider
+// that is still blocked gets one quick probe every 3s (a rejected probe costs
+// nothing and returns instantly), and the first provider that lets it through
+// answers. Ready providers are always tried first.
+const PROVIDER_LAST_PROBE = {};
+const INTERACTIVE_PROBE_MS = 3000;
+function interactiveWaitMs(id, now = Date.now()) {
+  if ((PROVIDER_BLOCKED_UNTIL[id] || 0) <= now) return 0;
+  return Math.max(0, (PROVIDER_LAST_PROBE[id] || 0) + INTERACTIVE_PROBE_MS - now);
 }
 function beginInteractive() {
   INTERACTIVE_PENDING++;
@@ -1575,7 +1589,7 @@ async function callClaude(system, user, maxTokens = 1000, onRateLimitWait, onQuo
     // one is momentarily blocked, wait exactly until the first frees up
     // (in short slices, capped at a minute in total) instead of firing a
     // request that is certain to be rejected.
-    const scored = baseOrder.map((id, i) => ({ id, i, w: providerWaitMs(id, need) }));
+    const scored = baseOrder.map((id, i) => ({ id, i, w: providerWaitMs(id, need, Date.now(), 0.3) }));
     if (scored.every((x) => x.w > 0) && preWaited < 60000) {
       const step = Math.min(Math.max(Math.min(...scored.map((x) => x.w)), 250), 4000);
       preWaited += step;
@@ -1670,6 +1684,67 @@ async function callClaude(system, user, maxTokens = 1000, onRateLimitWait, onQuo
 //    or after a generous deadline — never on a plain rate limit;
 //  - it never writes cooldown marks, so a translation can't push a provider
 //    out of rotation for book generation.
+// Fast-lane helpers. Instead of waiting for a stalled provider to time out
+// (up to 15s) before trying the next one, the next ready provider is started
+// after a short head start (INTERACTIVE_HEDGE_MS) and the FIRST good answer
+// wins. A provider that answers normally (well under the head start) is the
+// only one ever called, so no extra tokens are spent in the usual case.
+const INTERACTIVE_HEDGE_MS = 2200;
+const PROVIDER_LATENCY = {}; // rolling average response time (ms) per provider, interactive calls only
+function noteProviderLatency(id, ms) {
+  const prev = PROVIDER_LATENCY[id];
+  PROVIDER_LATENCY[id] = prev == null ? ms : prev * 0.6 + ms * 0.4;
+}
+function byProviderLatency(a, b) {
+  const la = PROVIDER_LATENCY[a.id] || 0;
+  const lb = PROVIDER_LATENCY[b.id] || 0;
+  return Math.abs(la - lb) < 700 ? 0 : la - lb; // near-equal speed counts as a tie
+}
+function hedgedInteractiveCall(ids, system, user, maxTokens, timeoutMs, need) {
+  return new Promise((resolve) => {
+    let launched = 0;
+    let settled = 0;
+    let hard = 0;
+    let done = false;
+    let lastError = null;
+    let missing = null;
+    let timer = null;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const launch = () => {
+      if (done || launched >= ids.length) return;
+      const id = ids[launched++];
+      const t0 = Date.now();
+      if ((PROVIDER_BLOCKED_UNTIL[id] || 0) > t0) PROVIDER_LAST_PROBE[id] = t0;
+      recordTokenUse(id, need);
+      callClaudeForProvider(id, system, user, maxTokens, undefined, { fastFail: true, timeoutMs }).then(
+        (text) => {
+          noteProviderLatency(id, Date.now() - t0);
+          finish({ ok: true, text });
+        },
+        (e) => {
+          settled++;
+          if (e instanceof MissingApiKeyError) missing = e;
+          else {
+            lastError = e;
+            (callClaudeInteractive.errs = callClaudeInteractive.errs || {})[id] = e;
+            if (e.status !== 429) hard++;
+          }
+          if (settled >= ids.length) finish({ ok: false, lastError, hard, missing });
+          else if (settled >= launched) launch(); // everything started so far failed — go straight to the next
+        }
+      );
+      clearTimeout(timer);
+      if (launched < ids.length) timer = setTimeout(launch, INTERACTIVE_HEDGE_MS);
+    };
+    launch();
+  });
+}
+
 async function callClaudeInteractive(chain, system, user, maxTokens, options) {
   const timeoutMs = options.timeoutMs || (maxTokens > 200 ? 30000 : 15000);
   // A translation should take longer rather than fail: it keeps waiting for a
@@ -1686,31 +1761,25 @@ async function callClaudeInteractive(chain, system, user, maxTokens, options) {
       const scored = chain.map((id, i) => ({
         id,
         i,
-        w: providerWaitMs(id, need, now),
+        w: interactiveWaitMs(id, now),
+        blocked: (PROVIDER_BLOCKED_UNTIL[id] || 0) > now ? 1 : 0,
         heavy: (HEAVY_IN_FLIGHT[id] || 0) > 0 ? 1 : 0,
         daily: isProviderCoolingDown(id) ? 1 : 0,
       }));
       const ready = scored
         .filter((x) => x.w === 0)
-        .sort((a, b) => a.daily - b.daily || a.heavy - b.heavy || byProviderLoad(a, b) || a.i - b.i);
+        .sort((a, b) => a.blocked - b.blocked || a.daily - b.daily || a.heavy - b.heavy || byProviderLatency(a, b) || byProviderLoad(a, b) || a.i - b.i);
       if (!ready.length) {
         if (Date.now() >= deadline) throw lastError || new Error("כל ספקי ה-AI עמוסים כרגע.");
         const soonest = Math.min(...scored.map((x) => x.w));
         await sleep(Math.min(Math.max(soonest, 250), 2000));
         continue;
       }
-      let hard = 0;
-      for (const { id } of ready) {
-        try {
-          recordTokenUse(id, need);
-          return await callClaudeForProvider(id, system, user, maxTokens, undefined, { fastFail: true, timeoutMs });
-        } catch (e) {
-          if (e instanceof MissingApiKeyError) throw e;
-          lastError = e;
-          (callClaudeInteractive.errs = callClaudeInteractive.errs || {})[id] = e;
-          if (e.status !== 429) hard++;
-        }
-      }
+      const res = await hedgedInteractiveCall(ready.map((x) => x.id), system, user, maxTokens, timeoutMs, need);
+      if (res.ok) return res.text;
+      if (res.missing && !res.lastError) throw res.missing;
+      if (res.lastError) lastError = res.lastError;
+      const hard = res.hard;
       // A timeout / 5xx / network blip is "busy, try again" — waited out with a
       // growing pause. Only a genuine config problem (bad key, wrong model or
       // URL) gives up quickly, because waiting can never fix that.
@@ -1955,8 +2024,11 @@ function preloadImageUrl(url, timeoutMs = 60000) {
 // cached error isn't served back. The chapter keeps its "drawing the scene"
 // spinner during the wait; only after every attempt fails does the sketch +
 // manual retry button appear.
-const POLLINATIONS_RETRY_DELAYS_MS = [0, 6000, 20000, 45000];
-const POLLINATIONS_ATTEMPT_TIMEOUT_MS = 40000;
+const POLLINATIONS_RETRY_DELAYS_MS = [0, 4000];
+const POLLINATIONS_ATTEMPT_TIMEOUT_MS = 35000;
+const POLLINATIONS_FAST_FAIL_MS = 8000; // an error this quick = refused (402/403/blocked), not overloaded: retrying is pointless
+const POLLINATIONS_BREAKER_MS = 3 * 60 * 1000;
+let pollinationsBrokenUntil = 0;
 const POLLINATIONS_MAX_PARALLEL = 2;
 const POLLINATIONS_MIN_GAP_MS = 1500;
 let pollinationsNextSlot = 0;
@@ -1972,11 +2044,17 @@ async function runPollinationsWithRetries(prompt, modelOverride) {
     if (wait > 0) await sleep(wait);
     await yieldToInteractive(20000); // translation first
     const url = generateImagePollinationsUrl(prompt, modelOverride); // new random seed each attempt
+    const t0 = Date.now();
     try {
       await preloadImageUrl(url, POLLINATIONS_ATTEMPT_TIMEOUT_MS);
+      pollinationsBrokenUntil = 0;
       return url;
     } catch (e) {
       lastErr = e;
+      if (Date.now() - t0 < POLLINATIONS_FAST_FAIL_MS) {
+        pollinationsBrokenUntil = Date.now() + POLLINATIONS_BREAKER_MS;
+        break; // refused outright: hand over to the backup providers now
+      }
     }
   }
   const err = new Error("שירות האיורים החינמי עמוס כרגע ולא הצליח להחזיר תמונה. אפשר ללחוץ \"טען איור מחדש\" בעוד כמה דקות.");
@@ -2099,11 +2177,26 @@ function clearImageProviderCooldown(provider) {
 //     generic placeholder — the procedural sketch is now only a last
 //     resort if pollinations.ai itself is down too.
 async function generateIllustration(prompt, priority = 1) {
-  const provider = getEffectiveImageProvider();
-  const apiKey = getApiKey(provider);
-  const tier1Available = (provider === "openai" || provider === "google") && !!apiKey && !isImageProviderCoolingDown(provider);
+  // Backup providers (OpenAI/Google) that have a key and aren't cooling down.
+  const backups = [];
+  for (const id of [getEffectiveImageProvider(), "google", "openai"]) {
+    if ((id === "openai" || id === "google") && !backups.includes(id) && getApiKey(id) && !isImageProviderCoolingDown(id)) backups.push(id);
+  }
 
-  if (tier1Available) {
+  // 1) pollinations.ai ALWAYS goes first. Skipped only while it is known to be
+  //    refusing requests AND a backup exists to take over.
+  let firstErr = null;
+  if (Date.now() >= pollinationsBrokenUntil || !backups.length) {
+    try {
+      return await generateImagePollinations(prompt, undefined, priority);
+    } catch (e) {
+      firstErr = e;
+    }
+  }
+
+  // 2) Backup only: the reader's own providers, one quick attempt each.
+  for (const provider of backups) {
+    const apiKey = getApiKey(provider);
     const configuredModel = getImageModel(provider) || IMAGE_MODEL_DEFAULTS[provider];
     const call = provider === "openai" ? generateImageOpenAI : generateImageGoogle;
     try {
@@ -2120,19 +2213,11 @@ async function generateIllustration(prompt, priority = 1) {
           markImageProviderCooldown(provider, isTransientImageError(e2) ? IMAGE_COOLDOWN_MS : 120000);
         }
       } else {
-        // Any miss (overload, timeout, key/model/safety problem): skip the
-        // first-choice provider for a while so the next chapters go straight
-        // to pollinations instead of each waiting out the same failure.
         markImageProviderCooldown(provider, isTransientImageError(e) ? IMAGE_COOLDOWN_MS : 120000);
       }
-      // Any tier-1 failure (model/key/safety/overload issue) falls through
-      // to the free pollinations.ai fallback below instead of throwing.
     }
   }
-
-  // pollinations paces and retries itself (see runPollinationsWithRetries),
-  // so there is no instant give-up here anymore.
-  return await generateImagePollinations(prompt, undefined, priority);
+  throw firstErr || new Error("לא הצלחנו ליצור איור — pollinations ושאר הספקים נכשלו.");
 }
 
 function providerSupportsImages(provider = getEffectiveImageProvider()) {
@@ -4321,10 +4406,64 @@ function publicWordPayload(word, translation, alternatives) {
 // same word saved from several stories): newest wording first, every other
 // sense kept. The dictionary view and the public-dictionary upload both use
 // exactly this, so they can never disagree. `ids` lists all saved copies.
+// One normalized key per word/phrase: case, outer spaces and repeated spaces ignored.
+function normWordKey(w) {
+  return String(w || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+// Collapses duplicate saved words into ONE entry each. Keeps the oldest entry (so
+// its original source spot stays), the newest chosen translation, and every other
+// translation / extra it had as alternatives. Returns the SAME object when there
+// is nothing to clean, so it never triggers a needless state update.
+function dedupeSavedWords(wordsObj) {
+  const groups = new Map();
+  let dup = false;
+  for (const w of Object.values(wordsObj || {})) {
+    const k = normWordKey(w.word) || "id:" + w.id;
+    if (!groups.has(k)) groups.set(k, []);
+    else dup = true;
+    groups.get(k).push(w);
+  }
+  if (!dup) return wordsObj;
+  const out = {};
+  groups.forEach((members) => {
+    if (members.length === 1) {
+      out[members[0].id] = members[0];
+      return;
+    }
+    const byOld = members.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    const byNew = members.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    const keep = byOld[0];
+    const newest = byNew[0];
+    const seen = new Set([senseText(newest.translation)]);
+    const alts = [];
+    const add = (x) => {
+      const t = senseText(x);
+      if (!t || seen.has(t)) return;
+      seen.add(t);
+      alts.push(x);
+    };
+    (newest.alternatives || []).forEach(add);
+    byNew.slice(1).forEach((m) => {
+      add(m.translation);
+      (m.alternatives || []).forEach(add);
+    });
+    const withMeaning = members.find((m) => m.meaningEn) || {};
+    out[keep.id] = {
+      ...keep,
+      translation: newest.translation,
+      alternatives: alts.slice(0, 6),
+      meaningEn: keep.meaningEn || withMeaning.meaningEn,
+      exampleEn: keep.exampleEn || withMeaning.exampleEn,
+    };
+  });
+  return out;
+}
+
 function mergeSavedWordCopies(wordsObj) {
   const groups = new Map();
   for (const w of Object.values(wordsObj || {})) {
-    const k = (w.word || "").toLowerCase().trim() || "id:" + w.id;
+    const k = normWordKey(w.word) || "id:" + w.id;
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(w);
   }
@@ -9726,7 +9865,7 @@ ${sentenceStyleLine}${poetryWarning}
 ${flowRule}
 This is chapter 1 of ${totalChapters} total chapter(s). ${lengthRule}
 Write in English only. Return ONLY this JSON shape:
-{"subtopic":"short subtopic label","sourceAuthor":"real author's full name","sourceWork":"real book or work title","storyTitle":"English story title","tagline":"one short English tagline","chapterTitle":"title of this chapter (same as story title if there is only 1 chapter)",${scenePlanSpec}"content":"the chapter text — at least ${info.wordsPerChapter} words, do not stop short"${recapSpec},${imagePromptSpec}${outlineSpec}}`;
+{"subtopic":"short subtopic label","sourceAuthor":"real author's full name","sourceWork":"real book or work title","storyTitle":"English story title","tagline":"one short English tagline","chapterTitle":"title of this chapter (same as story title if there is only 1 chapter)",${scenePlanSpec}"content":"the chapter text — at least ${info.wordsPerChapter} words, do not stop short"${recapSpec}${outlineSpec}}`;
   } else if (isFirst) {
     user = `Topic domain: ${category.topicPrompt}.
 Avoid repeating these already-used subtopics/tales: ${avoidTopics.length ? avoidTopics.join(", ") : "none"}. There is a huge real pool to choose from — do not feel limited to the examples given.
@@ -9739,7 +9878,7 @@ ${sentenceStyleLine}${poetryWarning}
 ${flowRule}
 This is chapter 1 of ${totalChapters} total chapter(s). ${lengthRule}
 Write in English only. Return ONLY this JSON shape:
-{"subtopic":"short subtopic label","sourceAuthor":"real author's full name","sourceWork":"real book or work title","storyTitle":"English story title","tagline":"one short English tagline","chapterTitle":"title of this chapter (same as story title if there is only 1 chapter)",${scenePlanSpec}"content":"the chapter text — at least ${info.wordsPerChapter} words, do not stop short"${recapSpec},${imagePromptSpec}${outlineSpec}}`;
+{"subtopic":"short subtopic label","sourceAuthor":"real author's full name","sourceWork":"real book or work title","storyTitle":"English story title","tagline":"one short English tagline","chapterTitle":"title of this chapter (same as story title if there is only 1 chapter)",${scenePlanSpec}"content":"the chapter text — at least ${info.wordsPerChapter} words, do not stop short"${recapSpec}${outlineSpec}}`;
   } else if (outlineEntry) {
     // Writing a specific chapter chosen from the pre-planned outline — this
     // may be requested out of order (earlier chapters might not exist yet),
@@ -9767,7 +9906,7 @@ ${lengthRule} Move the story naturally toward ${
       chapterIndex + 1 === totalChapters ? "a satisfying ending" : "the next part"
     }.
 Write in English only. Return ONLY this JSON shape:
-{"chapterTitle":"${outlineEntry.title.replace(/"/g, "'")}",${scenePlanSpec}"content":"the chapter text — at least ${info.wordsPerChapter} words, do not stop short"${recapSpec},${imagePromptSpec}}`;
+{"chapterTitle":"${outlineEntry.title.replace(/"/g, "'")}",${scenePlanSpec}"content":"the chapter text — at least ${info.wordsPerChapter} words, do not stop short"${recapSpec}}`;
   } else {
     user = `Continue the story titled "${storyTitle}" (subtopic: ${subtopic}), domain: ${category.topicPrompt}.
 This is chapter ${chapterIndex + 1} of ${totalChapters}.
@@ -9782,7 +9921,7 @@ ${lengthRule} Move the story naturally toward ${
       chapterIndex + 1 === totalChapters ? "a satisfying ending" : "the next part"
     }.
 Write in English only. Return ONLY this JSON shape:
-{"chapterTitle":"title of this chapter",${scenePlanSpec}"content":"the chapter text — at least ${info.wordsPerChapter} words, do not stop short"${recapSpec},${imagePromptSpec}}`;
+{"chapterTitle":"title of this chapter",${scenePlanSpec}"content":"the chapter text — at least ${info.wordsPerChapter} words, do not stop short"${recapSpec}}`;
   }
   // Story bible + story-so-far go in right before the difficulty rules.
   const contextBlock = [
@@ -9829,6 +9968,7 @@ Write in English only. Return ONLY this JSON shape:
     // past the first, regardless of which check below is what triggered it.
     if (attempt > 0) await sleep(qualityRetryDelayMs(attempt));
     let parsed;
+    let dedupRemoved = 0; // paragraphs the code had to cut as repeats — a sign worth a human-style second look
     try {
       const raw = await callClaude(system, user + retryNote, maxTokens, onRateLimitWait, onQuotaWait);
       parsed = parseChapterJson(raw);
@@ -9847,7 +9987,9 @@ Write in English only. Return ONLY this JSON shape:
     // one, and if what's left is still clearly repetitive, start over now
     // (before spending more calls on continuations) with feedback.
     if (!isPoetry && !isPlay) {
-      parsed.content = dedupeRepeatedParagraphs(parsed.content).text;
+      const dd = dedupeRepeatedParagraphs(parsed.content);
+      parsed.content = dd.text;
+      dedupRemoved += dd.removed || 0;
       const early = analyzeRepetition(parsed.content);
       if (early.severe && attempt < CHAPTER_ATTEMPTS - 1) {
         lastError = new Error(`הפרק יצא חוזר על עצמו (${early.reasons.join("; ")}) — כותבים אותו מחדש.`);
@@ -9911,7 +10053,11 @@ Write in English only. Return ONLY this JSON shape:
       // off mid-sentence (then it must pick up inside that sentence).
       const glue = isPoetry || /[.!?…"”’)\]]$/.test(parsed.content.trim()) ? "\n\n" : " ";
       parsed.content = `${parsed.content.trim()}${glue}${more.trim()}`;
-      if (!isPoetry && !isPlay) parsed.content = dedupeRepeatedParagraphs(parsed.content).text;
+      if (!isPoetry && !isPlay) {
+        const dd2 = dedupeRepeatedParagraphs(parsed.content);
+        parsed.content = dd2.text;
+        dedupRemoved += dd2.removed || 0;
+      }
     }
 
     if (countWords(parsed.content) < minWordsRequired || looksLikeBrokenGeneration(parsed.content)) {
@@ -9952,11 +10098,30 @@ Write in English only. Return ONLY this JSON shape:
     // the writing pass) rather than trying to catch everything in one shot —
     // slower, but a chapter that fails this is retried from scratch rather
     // than ever being shown to the reader.
+    // The editor read is a full extra request carrying the whole chapter, so
+    // it is spent where it matters (see chapterNeedsEditorReview): whenever the
+    // free in-browser checks saw ANY warning sign, on every chapter that was
+    // stitched together or regenerated, on poetry/plays (no repetition checks
+    // exist for them), on the first chapter, on a regular sample of the rest,
+    // and — safety net — on EVERY chapter for a while after any review fails.
+    const reviewWhy = chapterNeedsEditorReview({
+      content: parsed.content,
+      chapterIndex,
+      isFirst,
+      attempt,
+      continuations: guard,
+      dedupRemoved,
+      isPoetry,
+      isPlay,
+    });
     try {
-      const review = await reviewChapterContent({ content: parsed.content, level, info, isPoetry, onRateLimitWait });
-      if (!review.ok) {
-        lastError = new Error(`הפרק לא עבר את בדיקת האיכות הסופית: ${review.reason || "התוכן לא עומד ברמה הנדרשת"}.`);
-        continue;
+      if (reviewWhy) {
+        const review = await reviewChapterContent({ content: parsed.content, level, info, isPoetry, onRateLimitWait });
+        if (!review.ok) {
+          EDITOR_REVIEW_STRICT_LEFT = 6; // something slipped through: review the next chapters too
+          lastError = new Error(`הפרק לא עבר את בדיקת האיכות הסופית: ${review.reason || "התוכן לא עומד ברמה הנדרשת"}.`);
+          continue;
+        }
       }
     } catch (e) {
       // The review call itself failing (network hiccup, provider hiccup) is
@@ -9981,6 +10146,50 @@ Write in English only. Return ONLY this JSON shape:
 // verdict — defaults to "ok" whenever the model's answer can't be parsed
 // cleanly, since a shaky review response should never itself sink an
 // otherwise-fine chapter.
+// Chapters left to review unconditionally after a review caught a problem.
+let EDITOR_REVIEW_STRICT_LEFT = 0;
+// Decides — from free, local signals only — whether this finished chapter
+// gets the (expensive) editor read. Returns the reason, or "" to skip.
+function chapterNeedsEditorReview({ content, chapterIndex, isFirst, attempt, continuations, dedupRemoved, isPoetry, isPlay }) {
+  if (EDITOR_REVIEW_STRICT_LEFT > 0) {
+    EDITOR_REVIEW_STRICT_LEFT--;
+    return "strict";
+  }
+  if (isPoetry || isPlay) return "form"; // no local repetition checks exist for these
+  if (isFirst || chapterIndex === 0) return "first";
+  if (attempt > 0) return "retry"; // an earlier attempt already failed
+  if (continuations > 0) return "stitched"; // text from several calls joined together
+  if (dedupRemoved > 0) return "dedup";
+  // Leaked markup / JSON / wrong-language characters in an English chapter.
+  if (/[\u0590-\u05FF]|<\/?[a-z][^>]*>|\\n|"\s*:\s*"|```/i.test(content)) return "leak";
+  // Milder repetition than the hard-reject threshold: openers or phrases starting to recur.
+  const words = _pWords(content);
+  if (words.length >= 250) {
+    const counts = {};
+    let counted = 0;
+    for (const para of _paragraphs(content)) {
+      const w = _pWords(para);
+      if (w.length < 8) continue;
+      const k = w.slice(0, 2).join(" ");
+      counts[k] = (counts[k] || 0) + 1;
+      counted++;
+    }
+    let top = 0;
+    for (const k in counts) if (counts[k] > top) top = counts[k];
+    if (counted >= 6 && top >= 3 && top / counted >= 0.18) return "openers";
+    const grams = new Map();
+    for (let i = 0; i + 6 <= words.length; i++) {
+      const g = words.slice(i, i + 6).join(" ");
+      grams.set(g, (grams.get(g) || 0) + 1);
+    }
+    let rep = 0;
+    for (const [, c] of grams) if (c >= 2) rep += c;
+    if (rep / Math.max(1, words.length - 5) >= 0.03) return "phrases";
+  }
+  // Regular audit of otherwise clean chapters: every 3rd one.
+  if (chapterIndex % 3 === 2) return "sample";
+  return "";
+}
 async function reviewChapterContent({ content, level, info, isPoetry, onRateLimitWait }) {
   const system = isPoetry
     ? "You are a strict editor reviewing a finished English poem written for a Hebrew-speaking ESL learner. Check ONLY for real, concrete problems: (1) it reads as genuine prose chopped into lines rather than an actual poem, (2) a stanza or line is duplicated or nearly repeated elsewhere in the poem, (3) it stops abruptly mid-thought instead of ending as a real poem should, (4) the English is clearly far above or below the stated level. Output ONLY strict JSON: {\"ok\":true} if none of these problems are present, or {\"ok\":false,\"reason\":\"short specific reason\"} if any is. Do not flag stylistic choices, subject matter, or anything that isn't one of these four concrete problems."
@@ -15548,28 +15757,51 @@ function WordPopup({ popup, onClose, onSave, saved, onEdit, onPick }) {
         )}
 
         {!loading && !error && !editing && (
-          <button
-            onClick={onSave}
-            style={{
-              marginTop: 8,
-              width: "100%",
-              background: saved ? "#3E7C74" : "rgba(255,255,255,0.12)",
-              border: "none",
-              borderRadius: 8,
-              color: "var(--paper)",
-              padding: "7px 8px",
-              fontSize: 13,
-              fontWeight: 600,
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 6,
-            }}
-          >
-            {saved ? <AppIcon name="Check" size={14} /> : <AppIcon name="Plus" size={14} />}
-            {saved ? "נשמר במילים שלי" : "הוסף למילים שלי"}
-          </button>
+          saved ? (
+            <div
+              style={{
+                marginTop: 8,
+                width: "100%",
+                background: "rgba(62,124,116,0.35)",
+                borderRadius: 8,
+                color: "var(--paper)",
+                padding: "7px 8px",
+                fontSize: 13,
+                fontWeight: 600,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+                boxSizing: "border-box",
+              }}
+            >
+              <AppIcon name="Check" size={14} />
+              המילה הזאת כבר נשמרה במילים שלי
+            </div>
+          ) : (
+            <button
+              onClick={onSave}
+              style={{
+                marginTop: 8,
+                width: "100%",
+                background: "rgba(255,255,255,0.12)",
+                border: "none",
+                borderRadius: 8,
+                color: "var(--paper)",
+                padding: "7px 8px",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+              }}
+            >
+              <AppIcon name="Plus" size={14} />
+              הוסף למילים שלי
+            </button>
+          )
         )}
       </div>
     </div>
@@ -16711,13 +16943,21 @@ function App() {
   const activeCategory = activeStory ? CAT_BY_ID[activeStory.categoryId] : null;
 
   const savedWordsLowerForStory = useMemo(() => {
-    if (!state || !activeStoryId) return new Set();
+    if (!state) return new Set();
     const set = new Set();
     Object.values(state.words).forEach((w) => {
-      if (w.storyId === activeStoryId) set.add(w.word.toLowerCase());
+      if (w.word) set.add(normWordKey(w.word));
     });
     return set;
-  }, [state, activeStoryId]);
+  }, [state && state.words]);
+
+  // Keeps "המילים שלי" free of duplicates at all times: on load, after a cloud
+  // sync, or after any path that managed to add the same word twice.
+  useEffect(() => {
+    if (!state || !state.words) return;
+    const cleaned = dedupeSavedWords(state.words);
+    if (cleaned !== state.words) setState((prev) => ({ ...prev, words: dedupeSavedWords(prev.words) }));
+  }, [state && state.words]);
 
   // Multi-word saved entries only (a saved phrase like "give up", as
   // opposed to a single saved word) — StoryView turns these into
@@ -16727,11 +16967,16 @@ function App() {
   // marked too. charOffset is the position it was saved from; StoryView
   // re-checks that the text is still actually there before trusting it.
   const savedPhrasesForStory = useMemo(() => {
-    if (!state || !activeStoryId) return [];
-    return Object.values(state.words).filter(
-      (w) => w.storyId === activeStoryId && w.charOffset != null && /\s/.test(w.word.trim())
-    );
-  }, [state, activeStoryId]);
+    if (!state) return [];
+    const seen = new Set();
+    return Object.values(state.words).filter((w) => {
+      if (!w.word || !/\s/.test(w.word.trim())) return false;
+      const k = w.word.toLowerCase().replace(/\s+/g, " ").trim();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }, [state && state.words]);
 
   function goHome() {
     setView("home");
@@ -17996,7 +18241,15 @@ function App() {
     if (throttleMs > 0) await sleep(throttleMs);
     let url = null;
     let imageError = null;
-    let resolvedPrompt = imagePrompt && imagePrompt.trim() ? imagePrompt.trim() : null;
+    // Brief = book/chapter title + the chapter idea planned up front (local, no
+    // text-model request, the chapter text is never re-read). A model-written
+    // imagePrompt is only used for old cached chapters that have no planned idea.
+    const _sceneHint = quickSceneHint(storyId, chapterIndex);
+    let resolvedPrompt = _sceneHint.summary
+      ? await describeSceneForImage(chapterContent, _sceneHint)
+      : imagePrompt && imagePrompt.trim()
+        ? imagePrompt.trim()
+        : null;
     // 1) The server first (keeps going with the app closed; picked up when the
     //    app is opened again). null = server not available right now.
     let viaServer = null;
@@ -18362,9 +18615,9 @@ function App() {
   // any story, any time), reuse that translation instead of asking the AI
   // again — same word, same answer, no reason to spend a call on it twice.
   function findSavedWordTranslation(word) {
-    const key = (word || "").toLowerCase().trim();
+    const key = normWordKey(word);
     if (!key) return null;
-    const match = Object.values(state.words).find((w) => w.word.toLowerCase().trim() === key);
+    const match = Object.values(state.words).find((w) => normWordKey(w.word) === key);
     return match ? match.translation : null;
   }
 
@@ -18495,8 +18748,8 @@ function App() {
     // If this word is already saved in "המילים שלי", keep that entry's
     // translation in sync with the correction too.
     {
-      const key = popup.word.toLowerCase().trim();
-      const copies = Object.values(state.words).filter((w) => (w.word || "").toLowerCase().trim() === key);
+      const key = normWordKey(popup.word);
+      const copies = Object.values(state.words).filter((w) => normWordKey(w.word) === key);
       if (copies.length) {
         // every saved copy of this word (any story), so the dictionary keeps ONE consistent entry
         setState((prev) => {
@@ -18514,15 +18767,11 @@ function App() {
   function saveCurrentWord() {
     if (!popup || popup.loading || popup.error || !activeStory) return;
     const key = popup.word.toLowerCase();
-    const existing = Object.values(state.words).find((w) => w.storyId === activeStory.id && w.word.toLowerCase() === key);
-    if (existing) {
-      setState((prev) => {
-        const words = { ...prev.words };
-        delete words[existing.id];
-        return { ...prev, words };
-      });
-      return;
-    }
+    // Already in "המילים שלי" (from any story): nothing to save again.
+    // Removing a word is done from the words list only.
+    const alreadySaved = normWordKey(popup.word);
+    if (!alreadySaved) return;
+    if (Object.values(state.words).some((w) => normWordKey(w.word) === alreadySaved)) return;
     const id = uid();
     const chapter = chapterAt(activeStory, activeChapterIndex) || { content: "" };
     const word = {
@@ -18560,8 +18809,8 @@ function App() {
 
   const isCurrentWordSaved = useMemo(() => {
     if (!popup || !activeStory) return false;
-    const key = popup.word.toLowerCase();
-    return Object.values(state.words).some((w) => w.storyId === activeStory.id && w.word.toLowerCase() === key);
+    const key = normWordKey(popup.word);
+    return Object.values(state.words).some((w) => normWordKey(w.word) === key);
   }, [popup, state, activeStory]);
 
   if (!ready || !state) {
@@ -24939,12 +25188,20 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
     const content = chapter.content;
     const out = [];
     savedPhrases.forEach((p) => {
-      if (p.chapterIndex !== chapterIndex) return;
-      const start = p.charOffset;
-      const end = start + p.word.length;
-      if (start < 0 || end > content.length) return;
-      if (content.slice(start, end).toLowerCase() !== p.word.toLowerCase()) return;
-      out.push({ start, end });
+      const words = String(p.word || "").trim().split(/\s+/).filter(Boolean);
+      if (words.length < 2) return;
+      const esc = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      let re;
+      try {
+        re = new RegExp("(?<![A-Za-z])" + esc.join("\\s+") + "(?![A-Za-z])", "gi");
+      } catch (e) {
+        return;
+      }
+      let m;
+      while ((m = re.exec(content))) {
+        out.push({ start: m.index, end: m.index + m[0].length });
+        if (m[0].length === 0) re.lastIndex++;
+      }
     });
     return out;
   }, [savedPhrases, chapter, chapterIndex]);
@@ -27607,7 +27864,7 @@ function WordsView({ state, setState, onOpenStory }) {
       // translation + cleaned other senses (the dictionary then shows every
       // sense identically). Words you already have are never duplicated; one
       // that has no other senses yet gets them filled in from the public entry.
-      const localByKey = new Map(mergeSavedWordCopies(state.words || {}).map((g) => [(g.word || "").toLowerCase().trim(), g]));
+      const localByKey = new Map(mergeSavedWordCopies(state.words || {}).map((g) => [normWordKey(g.word), g]));
       let cacheAll = {};
       try { cacheAll = JSON.parse(localStorage.getItem(WORD_ALTS_KEY) || "{}"); } catch (e) {}
       const seenPublic = new Set();
@@ -27615,7 +27872,7 @@ function WordsView({ state, setState, onOpenStory }) {
       const fills = [];
       for (const w of all) {
         if (!w || !w.word || !w.translation) continue;
-        const key = w.word.toLowerCase().trim();
+        const key = normWordKey(w.word);
         if (seenPublic.has(key)) continue;
         seenPublic.add(key);
         const local = localByKey.get(key);
@@ -28860,7 +29117,11 @@ if (!window.__APP_DOMAIN_LOCKED__) {
     // gone it's a fast no-op.
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.getRegistrations().then((regs) => {
-        regs.forEach((reg) => reg.unregister());
+        regs.forEach((reg) => {
+          // Keep the push-notification worker (push-sw.js); remove any other.
+          const url = (reg.active || reg.waiting || reg.installing || {}).scriptURL || "";
+          if (!url.endsWith("/push-sw.js")) reg.unregister();
+        });
       }).catch(() => {});
       if (window.caches) {
         caches.keys().then((names) => {
