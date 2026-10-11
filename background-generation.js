@@ -42,20 +42,96 @@ function collectProviderConfigForBackend() {
   return providers;
 }
 
-// ---- remembered backup identity (see startBackgroundBookGeneration) ----
-const BG_IDENTITY_CACHE_KEY = "bgJobIdentityV1";
-function readBgIdentityCache(email) {
+// ---- this device's anonymous id (no login of any kind) ----
+// A random, unguessable id made once and kept on this device. The server
+// files this device's push subscription and finished books under it.
+const BG_DEVICE_ID_KEY = "bgDeviceIdV1";
+function getBgDeviceId() {
   try {
-    const c = JSON.parse(localStorage.getItem(BG_IDENTITY_CACHE_KEY) || "null");
-    if (c && c.uid && c.email === email) return c.uid;
-  } catch (e) { /* ignore */ }
-  return null;
+    let id = localStorage.getItem(BG_DEVICE_ID_KEY);
+    if (id && /^[A-Za-z0-9_-]{16,80}$/.test(id)) return id;
+    const rnd = (typeof crypto !== "undefined" && crypto.randomUUID)
+      ? crypto.randomUUID().replace(/-/g, "")
+      : Array.from({ length: 4 }, () => Math.random().toString(36).slice(2, 10)).join("");
+    id = "d" + rnd + Date.now().toString(36);
+    localStorage.setItem(BG_DEVICE_ID_KEY, id);
+    return id;
+  } catch (e) {
+    return "d" + Math.random().toString(36).slice(2) + Date.now().toString(36) + "xxxxxxxx";
+  }
 }
-function writeBgIdentityCache(email, uid) {
-  try { localStorage.setItem(BG_IDENTITY_CACHE_KEY, JSON.stringify({ email, uid })); } catch (e) { /* ignore */ }
+
+// Puts a finished book into the app's state (same bookkeeping the in-app
+// generator does). Safe to call twice for the same book.
+function insertDeliveredBook(setState, payload) {
+  const { story, catId, subtopic } = payload;
+  setState((prev) => {
+    if (prev.stories[story.id]) return prev;
+    const next = { ...prev, stories: { ...prev.stories, [story.id]: story } };
+    const cp = prev.categoryProgress && prev.categoryProgress[catId];
+    if (cp) {
+      const p = { ...cp };
+      p.storyIds = [...(p.storyIds || []), story.id];
+      p.usedSubtopics = [...(p.usedSubtopics || []), subtopic];
+      p.currentStoryId = story.id;
+      next.categoryProgress = { ...prev.categoryProgress, [catId]: p };
+    }
+    return next;
+  });
+  // Share it to the public library exactly as a book made inside the app is
+  // (the app's own function; it skips anything private and never re-sends a
+  // book that hasn't changed, so calling it for a repeat delivery is harmless).
+  try {
+    if (typeof maybePushStoryToPublicLibrary === "function") maybePushStoryToPublicLibrary(story);
+  } catch (e) { /* best-effort, like the in-app path */ }
 }
-function clearBgIdentityCache() {
-  try { localStorage.removeItem(BG_IDENTITY_CACHE_KEY); } catch (e) { /* ignore */ }
+
+async function ackBgDeliveries(ids) {
+  if (!BACKGROUND_JOBS_BACKEND_URL || !ids || !ids.length) return;
+  try {
+    await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/deliveries/${getBgDeviceId()}/ack`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+  } catch (e) { /* the server drops uncollected books after a while anyway */ }
+}
+
+// Re-registers an existing push subscription under this device's id (cheap,
+// once per page load) so notifications keep working after any server change.
+let bgPushSynced = false;
+async function syncBgPushSubscription() {
+  if (bgPushSynced || !BACKGROUND_JOBS_BACKEND_URL) return;
+  try {
+    const sub = await getPushSubscription();
+    if (!sub) return;
+    bgPushSynced = true;
+    await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/push/subscribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: getBgDeviceId(), subscription: sub }),
+    });
+  } catch (e) { bgPushSynced = false; }
+}
+
+// Collects books the server finished while the app was closed / in the
+// background. Called from index.html's resumeBackgroundWork (on open, when the
+// app becomes visible again, when the network returns). Returns how many new
+// books were added.
+async function pullBackgroundDeliveries(setState) {
+  if (!BACKGROUND_JOBS_BACKEND_URL) return 0;
+  syncBgPushSubscription();
+  try {
+    const res = await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/deliveries/${getBgDeviceId()}`);
+    if (!res.ok) return 0;
+    const { books } = await res.json();
+    if (!books || !books.length) return 0;
+    books.forEach((b) => insertDeliveredBook(setState, b));
+    await ackBgDeliveries(books.map((b) => b.story.id));
+    return books.length;
+  } catch (e) {
+    return 0;
+  }
 }
 
 // Starts a book generating on the server instead of in this tab. Returns
@@ -70,22 +146,8 @@ async function startBackgroundBookGeneration({ category, level, avoidTopics, for
     throw new Error("אין מפתח API מוגדר לאף ספק — אי אפשר ליצור ספר.");
   }
 
-  // Background generation needs a real cloud backup identity to deliver the
-  // finished book to. Working that out takes several network round-trips, and
-  // if the reader leaves the app during them the job is never sent — so the
-  // result is remembered on this device (the account id never changes) and
-  // the request to the server goes out at once on later books.
-  let email = getCloudEmail();
-  let uid = email ? readBgIdentityCache(email) : null;
-  if (!uid) {
-    const registryIdentity = await ensureGoogleSignedIn(null, true);
-    email = registryIdentity.email || getCloudEmail();
-    const targetConfig = await resolveBackupProject(registryIdentity, null, true);
-    const identity = await identityForProject(registryIdentity, targetConfig, null, true);
-    uid = identity.uid;
-    writeBgIdentityCache(email, uid);
-  }
-
+  // No login needed: the server files the finished book under this device's
+  // anonymous id, and the app collects it from there.
   const res = await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/jobs/generate-book`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -93,9 +155,7 @@ async function startBackgroundBookGeneration({ category, level, avoidTopics, for
     // closed a split second after the tap.
     keepalive: true,
     body: JSON.stringify({
-      userId: hashEmailToDocId(email),
-      email,
-      uid,
+      userId: getBgDeviceId(),
       providers,
       bookConfig: { category, level, avoidTopics, forcedQuery },
     }),
@@ -138,18 +198,10 @@ async function enableBackgroundGenerationNotifications() {
       applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
     }));
 
-  const registryIdentity = await ensureGoogleSignedIn(null, true);
-  const email = registryIdentity.email || getCloudEmail();
-  // Prime the remembered identity so the very first background book is sent instantly.
-  try {
-    const tc = await resolveBackupProject(registryIdentity, null, true);
-    const idn = await identityForProject(registryIdentity, tc, null, true);
-    writeBgIdentityCache(email, idn.uid);
-  } catch (e) { /* not essential */ }
   const subRes = await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/push/subscribe`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ userId: hashEmailToDocId(email), subscription }),
+    body: JSON.stringify({ userId: getBgDeviceId(), subscription }),
   });
   if (!subRes.ok) throw new Error(`השרת לא קיבל את ההרשמה להתראות (${subRes.status}).`);
 }
@@ -178,11 +230,10 @@ async function disableBackgroundGenerationNotifications() {
   await sub.unsubscribe();
   try {
     if (BACKGROUND_JOBS_BACKEND_URL) {
-      const email = getCloudEmail();
       await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/push/unsubscribe`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId: email ? hashEmailToDocId(email) : null, endpoint }),
+        body: JSON.stringify({ userId: getBgDeviceId(), endpoint }),
       });
     }
   } catch (e) {
@@ -332,7 +383,6 @@ async function createNewStoryViaBackendImpl(catId, level, avoidTopics, ctx) {
     removeLoadingJob(jobId);
     // Server unavailable (no connection, no cloud sign-in, server error):
     // don't block the reader — generate in the app as usual.
-    clearBgIdentityCache();
     console.warn("Background generation unavailable — generating in the app instead:", e);
     await createNewStory(catId, level);
     return;
@@ -358,32 +408,16 @@ async function createNewStoryViaBackendImpl(catId, level, avoidTopics, ctx) {
         const r = job.result;
         let delivered = false;
         if (r && r.story && r.story.id) {
-          // The server hands the finished book straight back: put it in the
-          // app right now (same bookkeeping the in-app generator does), no
-          // cloud round-trip needed. The server also saved it to the backup.
-          setState((prev) => {
-            if (prev.stories[r.story.id]) return prev;
-            const next = { ...prev, stories: { ...prev.stories, [r.story.id]: r.story } };
-            const cp = prev.categoryProgress && prev.categoryProgress[r.catId];
-            if (cp) {
-              const p = { ...cp };
-              p.storyIds = [...(p.storyIds || []), r.story.id];
-              p.usedSubtopics = [...(p.usedSubtopics || []), r.subtopic];
-              p.currentStoryId = r.story.id;
-              next.categoryProgress = { ...prev.categoryProgress, [r.catId]: p };
-            }
-            return next;
-          });
+          // The server hands the finished book straight back while the app is open.
+          insertDeliveredBook(setState, r);
+          ackBgDeliveries([r.story.id]);
           delivered = true;
         } else {
-          const patch = await pullBackup(state, null, false).catch(() => null);
-          if (patch) setState((prev) => mergeBackupPatch(prev, patch));
-          delivered = !!(patch && patch.stories && patch.stories[job.bookId]);
+          delivered = (await pullBackgroundDeliveries(setState)) > 0;
         }
         if (!delivered) {
           removeLoadingJob(jobId);
-          clearBgIdentityCache();
-    console.warn("Server finished but the book did not arrive — generating in the app instead.");
+          console.warn("Server finished but the book did not arrive — generating in the app instead.");
           await createNewStory(catId, level);
           return;
         }
@@ -394,14 +428,12 @@ async function createNewStoryViaBackendImpl(catId, level, avoidTopics, ctx) {
       // in the app instead, exactly like before.
       activeJobIdsRef.current.delete(jobId);
       removeLoadingJob(jobId);
-      clearBgIdentityCache();
     console.warn("Background job failed — generating in the app instead:", job.error);
       await createNewStory(catId, level);
     } catch (e) {
       // Lost contact with the server mid-job (offline, server restarted…).
       activeJobIdsRef.current.delete(jobId);
       removeLoadingJob(jobId);
-      clearBgIdentityCache();
     console.warn("Lost contact with the server — generating in the app instead:", e);
       await createNewStory(catId, level);
     }
