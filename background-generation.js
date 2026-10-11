@@ -42,6 +42,22 @@ function collectProviderConfigForBackend() {
   return providers;
 }
 
+// ---- remembered backup identity (see startBackgroundBookGeneration) ----
+const BG_IDENTITY_CACHE_KEY = "bgJobIdentityV1";
+function readBgIdentityCache(email) {
+  try {
+    const c = JSON.parse(localStorage.getItem(BG_IDENTITY_CACHE_KEY) || "null");
+    if (c && c.uid && c.email === email) return c.uid;
+  } catch (e) { /* ignore */ }
+  return null;
+}
+function writeBgIdentityCache(email, uid) {
+  try { localStorage.setItem(BG_IDENTITY_CACHE_KEY, JSON.stringify({ email, uid })); } catch (e) { /* ignore */ }
+}
+function clearBgIdentityCache() {
+  try { localStorage.removeItem(BG_IDENTITY_CACHE_KEY); } catch (e) { /* ignore */ }
+}
+
 // Starts a book generating on the server instead of in this tab. Returns
 // the jobId, or throws (e.g. no cloud backup set up yet — background
 // generation has nowhere to deliver the finished book without one).
@@ -54,22 +70,32 @@ async function startBackgroundBookGeneration({ category, level, avoidTopics, for
     throw new Error("אין מפתח API מוגדר לאף ספק — אי אפשר ליצור ספר.");
   }
 
-  // Background generation needs a real cloud backup identity to deliver
-  // the finished book to — set one up (or reuse the existing one) exactly
-  // the way a normal manual backup would, including choosing/creating this
-  // reader's pooled project.
-  const registryIdentity = await ensureGoogleSignedIn(null, true);
-  const email = registryIdentity.email || getCloudEmail();
-  const targetConfig = await resolveBackupProject(registryIdentity, null, true);
-  const identity = await identityForProject(registryIdentity, targetConfig, null, true);
+  // Background generation needs a real cloud backup identity to deliver the
+  // finished book to. Working that out takes several network round-trips, and
+  // if the reader leaves the app during them the job is never sent — so the
+  // result is remembered on this device (the account id never changes) and
+  // the request to the server goes out at once on later books.
+  let email = getCloudEmail();
+  let uid = email ? readBgIdentityCache(email) : null;
+  if (!uid) {
+    const registryIdentity = await ensureGoogleSignedIn(null, true);
+    email = registryIdentity.email || getCloudEmail();
+    const targetConfig = await resolveBackupProject(registryIdentity, null, true);
+    const identity = await identityForProject(registryIdentity, targetConfig, null, true);
+    uid = identity.uid;
+    writeBgIdentityCache(email, uid);
+  }
 
   const res = await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/jobs/generate-book`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // keepalive: lets the browser finish sending this even if the app is
+    // closed a split second after the tap.
+    keepalive: true,
     body: JSON.stringify({
       userId: hashEmailToDocId(email),
       email,
-      uid: identity.uid,
+      uid,
       providers,
       bookConfig: { category, level, avoidTopics, forcedQuery },
     }),
@@ -114,6 +140,12 @@ async function enableBackgroundGenerationNotifications() {
 
   const registryIdentity = await ensureGoogleSignedIn(null, true);
   const email = registryIdentity.email || getCloudEmail();
+  // Prime the remembered identity so the very first background book is sent instantly.
+  try {
+    const tc = await resolveBackupProject(registryIdentity, null, true);
+    const idn = await identityForProject(registryIdentity, tc, null, true);
+    writeBgIdentityCache(email, idn.uid);
+  } catch (e) { /* not essential */ }
   const subRes = await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/push/subscribe`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -300,6 +332,7 @@ async function createNewStoryViaBackendImpl(catId, level, avoidTopics, ctx) {
     removeLoadingJob(jobId);
     // Server unavailable (no connection, no cloud sign-in, server error):
     // don't block the reader — generate in the app as usual.
+    clearBgIdentityCache();
     console.warn("Background generation unavailable — generating in the app instead:", e);
     await createNewStory(catId, level);
     return;
@@ -349,7 +382,8 @@ async function createNewStoryViaBackendImpl(catId, level, avoidTopics, ctx) {
         }
         if (!delivered) {
           removeLoadingJob(jobId);
-          console.warn("Server finished but the book did not arrive — generating in the app instead.");
+          clearBgIdentityCache();
+    console.warn("Server finished but the book did not arrive — generating in the app instead.");
           await createNewStory(catId, level);
           return;
         }
@@ -360,13 +394,15 @@ async function createNewStoryViaBackendImpl(catId, level, avoidTopics, ctx) {
       // in the app instead, exactly like before.
       activeJobIdsRef.current.delete(jobId);
       removeLoadingJob(jobId);
-      console.warn("Background job failed — generating in the app instead:", job.error);
+      clearBgIdentityCache();
+    console.warn("Background job failed — generating in the app instead:", job.error);
       await createNewStory(catId, level);
     } catch (e) {
       // Lost contact with the server mid-job (offline, server restarted…).
       activeJobIdsRef.current.delete(jobId);
       removeLoadingJob(jobId);
-      console.warn("Lost contact with the server — generating in the app instead:", e);
+      clearBgIdentityCache();
+    console.warn("Lost contact with the server — generating in the app instead:", e);
       await createNewStory(catId, level);
     }
   };
