@@ -16806,6 +16806,7 @@ function App() {
       const st = latestStateRef.current;
       if (!st) return;
       if (typeof BgServer !== "undefined") BgServer.poke(); // collect anything the server finished meanwhile
+      if (typeof pullBackgroundDeliveries === "function") pullBackgroundDeliveries(setState).then((n) => { if (n) setTimeout(resumeBackgroundWork, 1000); }).catch(() => {});
       Object.values(st.stories).forEach((s) => {
         (s.chapters || []).forEach((c, i) => {
           if (!c) return;
