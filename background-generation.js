@@ -103,7 +103,7 @@ async function enableBackgroundGenerationNotifications() {
   const permission = await Notification.requestPermission();
   if (permission !== "granted") throw new Error("לא ניתנה הרשאה להתראות.");
 
-  const vapidPublicKey = "BNxg1-2Lc1RehM01VWGa6lsOhMD7Ypum1U07G5Se5wJsCakYWG3cOLYeQ-e5WAWmHQ7nLqQF4GAUTBh7rZMYRh8"; // TODO: paste the VAPID_PUBLIC_KEY from the backend's .env here (it's meant to be public)
+  const vapidPublicKey = "BNxg1-2Lc1RehM01VWGa6lsOhMD7Ypum1U07G5Se5wJsCakYWG3cOLYeQ-e5WAWmHQ7nLqQF4GAUTBh7rZMYRh8"; // public VAPID key (safe to ship in client code)
   if (!vapidPublicKey) throw new Error("חסר מפתח VAPID ציבורי בקוד (background-generation.js).");
   await navigator.serviceWorker.ready;
   const subscription = (await reg.pushManager.getSubscription()) ||
@@ -321,19 +321,53 @@ async function createNewStoryViaBackendImpl(catId, level, avoidTopics, ctx) {
         return;
       }
       if (job.status === "done") {
-        const patch = await pullBackup(state, null, false).catch(() => null);
-        if (patch) setState((prev) => mergeBackupPatch(prev, patch));
         activeJobIdsRef.current.delete(jobId);
+        const r = job.result;
+        let delivered = false;
+        if (r && r.story && r.story.id) {
+          // The server hands the finished book straight back: put it in the
+          // app right now (same bookkeeping the in-app generator does), no
+          // cloud round-trip needed. The server also saved it to the backup.
+          setState((prev) => {
+            if (prev.stories[r.story.id]) return prev;
+            const next = { ...prev, stories: { ...prev.stories, [r.story.id]: r.story } };
+            const cp = prev.categoryProgress && prev.categoryProgress[r.catId];
+            if (cp) {
+              const p = { ...cp };
+              p.storyIds = [...(p.storyIds || []), r.story.id];
+              p.usedSubtopics = [...(p.usedSubtopics || []), r.subtopic];
+              p.currentStoryId = r.story.id;
+              next.categoryProgress = { ...prev.categoryProgress, [r.catId]: p };
+            }
+            return next;
+          });
+          delivered = true;
+        } else {
+          const patch = await pullBackup(state, null, false).catch(() => null);
+          if (patch) setState((prev) => mergeBackupPatch(prev, patch));
+          delivered = !!(patch && patch.stories && patch.stories[job.bookId]);
+        }
+        if (!delivered) {
+          removeLoadingJob(jobId);
+          console.warn("Server finished but the book did not arrive — generating in the app instead.");
+          await createNewStory(catId, level);
+          return;
+        }
         finishLoadingSuccess(jobId, { storyId: job.bookId, chapterIndex: 0 }, null);
         return;
       }
+      // Server-side failure: don't strand the reader — just make the book
+      // in the app instead, exactly like before.
       activeJobIdsRef.current.delete(jobId);
       removeLoadingJob(jobId);
-      setErrorMsg(job.error || "יצירת הספר נכשלה.");
+      console.warn("Background job failed — generating in the app instead:", job.error);
+      await createNewStory(catId, level);
     } catch (e) {
+      // Lost contact with the server mid-job (offline, server restarted…).
       activeJobIdsRef.current.delete(jobId);
       removeLoadingJob(jobId);
-      setErrorMsg(e.message || "אירעה שגיאה במעקב אחרי היצירה.");
+      console.warn("Lost contact with the server — generating in the app instead:", e);
+      await createNewStory(catId, level);
     }
   };
   setTimeout(poll, 4000);
