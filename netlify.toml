@@ -10,6 +10,12 @@
 # — so a future move off Netlify only means deploying the matching function
 # file for that platform (see the commented-out equivalents at the bottom of
 # fetch-article.js), never touching index.html again.
+[build]
+command = "npm run build"
+publish = "dist"
+
+[build.environment]
+NODE_VERSION = "20"
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/:splat"
