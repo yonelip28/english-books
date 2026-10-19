@@ -31254,7 +31254,15 @@ function LibraryView({ state, setState, onOpen, onRequestDelete }) {
   // Always show every topic as a filter option — including ones with no
   // books yet — rather than only topics some story already exists in, so
   // the filter row doesn't reshuffle/disappear options as the library grows.
-  const topicOptions = useMemo(() => [...CATEGORIES, SEARCH_CATEGORY, PDF_IMPORT_CATEGORY, ARTICLE_IMPORT_CATEGORY, SCAN_IMPORT_CATEGORY, SCAN_TEXT_CATEGORY], []);
+  // The scientific/historical articles chip sits right after poetry (just
+  // before "חיפוש חופשי"), not in the middle of the story topics.
+  const topicOptions = useMemo(() => {
+    const articles = CATEGORIES.find((c) => c.id === "articles");
+    const rest = CATEGORIES.filter((c) => c.id !== "articles");
+    const poetryIdx = rest.findIndex((c) => c.id === "poetry");
+    const ordered = articles ? [...rest.slice(0, poetryIdx + 1), articles, ...rest.slice(poetryIdx + 1)] : rest;
+    return [...ordered, SEARCH_CATEGORY, PDF_IMPORT_CATEGORY, ARTICLE_IMPORT_CATEGORY, SCAN_IMPORT_CATEGORY, SCAN_TEXT_CATEGORY];
+  }, []);
 
   const stories = allStories.filter((s) => {
     if (sortMode === "size") {
