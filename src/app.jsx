@@ -28893,31 +28893,6 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
         </div>
       )}
 
-      {atStoryEnd && story.categoryId === "articles" && !isSearchStory && (hasPreviousLevelStory || hasNextLevelStory) && (
-        <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
-          {hasPreviousLevelStory && (
-            <PrimaryButton
-              onClick={onGoToPreviousLevel}
-              title="עבור למאמר הקודם"
-              style={{ flex: 1, minWidth: 0, background: category.color, justifyContent: "center" }}
-            >
-              <AppIcon name="ChevronRight" size={16} style={{ flexShrink: 0 }} />
-              מאמר קודם
-            </PrimaryButton>
-          )}
-          {hasNextLevelStory && (
-            <PrimaryButton
-              onClick={onGoToNextLevel}
-              title="עבור למאמר הבא"
-              style={{ flex: 1, minWidth: 0, background: category.color, justifyContent: "center" }}
-            >
-              מאמר הבא
-              <AppIcon name="ChevronLeft" size={16} style={{ flexShrink: 0 }} />
-            </PrimaryButton>
-          )}
-        </div>
-      )}
-
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 20 }}>
         {atStoryEnd && hasCover && (
           <SecondaryButton
@@ -28944,14 +28919,27 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
         )}
         {atStoryEnd && !isSearchStory && (
           <>
-            <PrimaryButton onClick={() => onStartNext(true)} style={{ background: category.color }}>
-              {nextLevelHasStory ? `פתיחת ${category.itemLabel || "סיפור"} · רמה ${story.level + 1}` : `${category.itemLabel || "סיפור"} חדש · רמה ${story.level + 1}`}
-              <AppIcon name="ChevronLeft" size={16} />
-            </PrimaryButton>
+            {story.categoryId === "articles" && hasNextLevelStory ? (
+              <PrimaryButton onClick={onGoToNextLevel} style={{ background: category.color }}>
+                {nextLevelHasStory ? `מאמר הבא · רמה ${story.level + 1}` : "מאמר הבא"}
+                <AppIcon name="ChevronLeft" size={16} />
+              </PrimaryButton>
+            ) : (
+              <PrimaryButton onClick={() => onStartNext(true)} style={{ background: category.color }}>
+                {nextLevelHasStory ? `פתיחת ${category.itemLabel || "סיפור"} · רמה ${story.level + 1}` : `${category.itemLabel || "סיפור"} חדש · רמה ${story.level + 1}`}
+                <AppIcon name="ChevronLeft" size={16} />
+              </PrimaryButton>
+            )}
             <SecondaryButton onClick={() => onStartNext(false)}>
               <AppIcon name="RotateCw" size={14} />
               {category.itemLabel || "סיפור"} נוסף באותה רמה
             </SecondaryButton>
+            {story.categoryId === "articles" && hasPreviousLevelStory && (
+              <PrimaryButton onClick={onGoToPreviousLevel} style={{ background: category.color }}>
+                <AppIcon name="ChevronRight" size={16} />
+                מאמר קודם
+              </PrimaryButton>
+            )}
           </>
         )}
         {atStoryEnd && isSearchStory && (
