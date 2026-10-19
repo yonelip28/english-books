@@ -19240,6 +19240,28 @@ function App() {
         }));
       }
     }
+    // A story that is still being written (an empty shell with a running job) must not
+    // pull "המשך קריאה" onto its loading page. If this topic has another story that was
+    // opened or created before it and already has text, open THAT one instead. (The
+    // floating loading card still opens the loading page.) If there is no other written
+    // story, the loading page is the only thing to show, as before.
+    if (
+      target &&
+      !target.isImported &&
+      !(target.chapters || []).some((c) => c) &&
+      loadingJobs.some((j) => !j.done && j.target && j.target.storyId === target.id)
+    ) {
+      const stillWriting = target.id;
+      let prevOpened = null;
+      let prevTime = -1;
+      Object.values(state.stories || {}).forEach((st) => {
+        if (!st || st.id === stillWriting || st.categoryId !== catId) return;
+        if (!(st.chapters || []).some((c) => c && typeof c.content === "string" && c.content.trim())) return;
+        const t = Math.max(st.lastOpenedAt || 0, st.createdAt || 0);
+        if (t > prevTime) { prevOpened = st; prevTime = t; }
+      });
+      if (prevOpened) target = prevOpened;
+    }
     // A single-chapter item (article / poem) whose text was never written and is not
     // being written right now is a leftover empty shell from a failed attempt:
     // drop it and write a fresh one instead of re-running the same failure.
