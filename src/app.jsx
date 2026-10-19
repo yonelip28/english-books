@@ -179,21 +179,23 @@ async function ackBgDeliveries(ids) {
   } catch (e) { /* the server drops uncollected books after a while anyway */ }
 }
 
-// Re-registers an existing push subscription under this device's id (cheap,
-// once per page load) so notifications keep working after any server change.
-let bgPushSynced = false;
+// Re-registers an existing push subscription under this device's id (cheap: at most
+// once every 6 hours, and every time the app comes back to the screen after that),
+// so notifications keep working after a server change, a restart or a browser
+// subscription refresh.
+let bgPushSyncedAt = 0;
 async function syncBgPushSubscription() {
-  if (bgPushSynced || !BACKGROUND_JOBS_BACKEND_URL) return;
+  if (!BACKGROUND_JOBS_BACKEND_URL || Date.now() - bgPushSyncedAt < 6 * 60 * 60 * 1000) return;
   try {
     const sub = await getPushSubscription();
     if (!sub) return;
-    bgPushSynced = true;
+    bgPushSyncedAt = Date.now();
     await fetch(`${BACKGROUND_JOBS_BACKEND_URL}/api/push/subscribe`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ userId: getBgDeviceId(), subscription: sub }),
     });
-  } catch (e) { bgPushSynced = false; }
+  } catch (e) { bgPushSyncedAt = 0; }
 }
 
 // Collects what the server finished while the app was closed / in the
@@ -289,7 +291,7 @@ async function runBackgroundDiagnostics() {
       let st = await getJson(`${base}/api/push/status/${dev}`);
       let n = (st.json && st.json.devices) || 0;
       if (sub && !n) {
-        bgPushSynced = false;
+        bgPushSyncedAt = 0;
         await syncBgPushSubscription();
         st = await getJson(`${base}/api/push/status/${dev}`);
         n = (st.json && st.json.devices) || 0;
@@ -1096,7 +1098,7 @@ if (typeof document !== "undefined" && typeof window !== "undefined" && !window.
   window.__bgVisBound = true;
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") bgTellServerVisibility("hidden");
-    else { bgTellServerVisibility("visible"); bgClearProgressNotifications(); }
+    else { bgTellServerVisibility("visible"); bgClearProgressNotifications(); syncBgPushSubscription(); }
   });
   window.addEventListener("pagehide", () => bgTellServerVisibility("hidden"));
 }
