@@ -54,8 +54,20 @@ self.addEventListener("push", (event) => {
         // Live "writing… 42%" updates are only for when the app is NOT on screen.
         const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
         if (wins.some((c) => c.visibilityState === "visible")) {
-          const open = await self.registration.getNotifications({ tag });
-          open.forEach((n) => n.close());
+          // The app is on screen, so no progress notification is wanted. Chrome still
+          // expects every push to end in a notification, so show a silent one and
+          // remove it straight away (this also clears an older progress notification).
+          try {
+            await self.registration.showNotification(data.title || "חדר קריאה", {
+              tag,
+              silent: true,
+              icon: "/icon-192.png",
+              badge: "/badge-96.png",
+              data: { kind: "progress" },
+            });
+            const open = await self.registration.getNotifications({ tag });
+            open.forEach((n) => n.close());
+          } catch (e) { /* nothing to clean up */ }
           return;
         }
       }
