@@ -6007,6 +6007,14 @@ function AppIcon({ name, size = 16, color, className = "" }) {
           <path d="M21 12a9 9 0 0 0-9-9" />
         </svg>
       );
+    case "Pin":
+    case "PinFilled":
+      return (
+        <svg {...common} fill={name === "PinFilled" ? color || "currentColor" : "none"}>
+          <line x1="12" y1="17" x2="12" y2="22" />
+          <path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z" />
+        </svg>
+      );
     case "Bell":
       return <svg {...common}><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" /></svg>;
     case "X":
@@ -14834,6 +14842,46 @@ function setReadingPosition(storyId, chapterIndex, charOffset) {
   const all = getReadingPositions();
   all[readingPositionKey(storyId, chapterIndex)] = { charOffset, ts: Date.now() };
   appStorage.setItem(READING_POSITIONS_KEY, JSON.stringify(all));
+}
+
+// Last place the read-aloud reached, one per book (survives leaving the book
+// and reopening it) — lets "הקראה" offer to continue from there.
+const TTS_LAST_POS_KEY = "reading-room-tts-last-pos-v1";
+function getTtsLastPos(storyId) {
+  try {
+    const all = JSON.parse(appStorage.getItem(TTS_LAST_POS_KEY) || "{}");
+    const v = all[storyId];
+    return v && typeof v.charOffset === "number" ? v : null; // { chapterIndex, charOffset, ts } | null
+  } catch (e) {
+    return null;
+  }
+}
+function setTtsLastPos(storyId, chapterIndex, charOffset) {
+  if (!storyId || charOffset == null) return;
+  try {
+    const all = JSON.parse(appStorage.getItem(TTS_LAST_POS_KEY) || "{}");
+    all[storyId] = { chapterIndex, charOffset, ts: Date.now() };
+    appStorage.setItem(TTS_LAST_POS_KEY, JSON.stringify(all));
+  } catch (e) {}
+}
+
+// Reading spots the reader pinned (📌) in the read-aloud menu — several per
+// book, kept in their own store so they outlive the automatic "last spot".
+const TTS_PINS_KEY = "reading-room-tts-pins-v1";
+function getTtsPins(storyId) {
+  try {
+    const all = JSON.parse(appStorage.getItem(TTS_PINS_KEY) || "{}");
+    return Array.isArray(all[storyId]) ? all[storyId] : []; // [{ id, chapterIndex, charOffset, preview, ts }]
+  } catch (e) {
+    return [];
+  }
+}
+function setTtsPins(storyId, list) {
+  try {
+    const all = JSON.parse(appStorage.getItem(TTS_PINS_KEY) || "{}");
+    all[storyId] = list;
+    appStorage.setItem(TTS_PINS_KEY, JSON.stringify(all));
+  } catch (e) {}
 }
 
 // Finds the character offset (matching the data-tts-start attribute
@@ -25401,7 +25449,7 @@ function storeTtsRate(newRate) {
   }
 }
 
-const ReadAloudButton = React.forwardRef(function ReadAloudButton({ text, color, onFinished, resolveText, onBoundary, onStatusChange, afterControls, pendingManualResumeRef }, ref) {
+const ReadAloudButton = React.forwardRef(function ReadAloudButton({ text, color, onFinished, resolveText, onBoundary, onStatusChange, afterControls, pendingManualResumeRef, onResumeRequest, onPlayRequest }, ref) {
   const [status, setStatus] = useState("idle"); // idle | speaking | paused
   const [rate, setRate] = useState(loadStoredTtsRate);
   const supported = typeof window !== "undefined" && "speechSynthesis" in window;
@@ -25823,7 +25871,7 @@ const ReadAloudButton = React.forwardRef(function ReadAloudButton({ text, color,
   return (
     <>
       {status === "idle" && (
-        <SecondaryButton onClick={play} style={{ padding: "6px 7px", fontSize: 11.5, flexShrink: 0, whiteSpace: "nowrap" }}>
+        <SecondaryButton onClick={(e) => (typeof onPlayRequest === "function" ? onPlayRequest(e) : play())} style={{ padding: "6px 7px", fontSize: 11.5, flexShrink: 0, whiteSpace: "nowrap" }}>
           <AppIcon name="Play" size={12} />
           הקראה
         </SecondaryButton>
@@ -25835,7 +25883,7 @@ const ReadAloudButton = React.forwardRef(function ReadAloudButton({ text, color,
         </SecondaryButton>
       )}
       {status === "paused" && (
-        <SecondaryButton onClick={resume} style={{ background: `${color}18`, borderColor: color, color, padding: "6px 7px", fontSize: 11.5, flexShrink: 0, whiteSpace: "nowrap" }}>
+        <SecondaryButton onClick={(e) => (typeof onResumeRequest === "function" ? onResumeRequest(e) : resume())} style={{ background: `${color}18`, borderColor: color, color, padding: "6px 7px", fontSize: 11.5, flexShrink: 0, whiteSpace: "nowrap" }}>
           <AppIcon name="Play" size={12} />
           המשך
         </SecondaryButton>
@@ -27354,6 +27402,13 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
         const el = container.querySelector(`[data-tts-start="${toDomOffset(pendingResume.absoluteOffset)}"]`);
         if (el) {
           el.scrollIntoView({ behavior: "smooth", block: "start" });
+          if (pendingResume.thenPlay) {
+            // Came from "הקראה → המשך ממקום אחרון": start reading from this word.
+            pendingWordResumeRef.current = { absoluteOffset: pendingResume.absoluteOffset };
+            setTimeout(() => {
+              if (readAloudRef.current) readAloudRef.current.play();
+            }, 250);
+          }
           setPendingResume(null);
           return;
         }
@@ -27944,6 +27999,102 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
   const [titleHighlightOffset, setTitleHighlightOffset] = useState(null);
   const lastIntroLengthRef = useRef(0);
   const [readAloudStatus, setReadAloudStatus] = useState("idle");
+  // Small choice menu shown when "המשך" is pressed on a paused read-aloud
+  // (from the top button or the floating one): continue from where the
+  // reading stopped, or from where the reader currently is on screen.
+  const [resumeMenu, setResumeMenu] = useState(null); // { top, left, width, mode } | null
+  // Where the read-aloud last got to in this book (kept across leaving it).
+  const [savedReadPos, setSavedReadPos] = useState(() => getTtsLastPos(story.id));
+  useEffect(() => {
+    setSavedReadPos(getTtsLastPos(story.id));
+  }, [story.id]);
+  const [ttsPins, setTtsPinsState] = useState(() => getTtsPins(story.id));
+  useEffect(() => {
+    setTtsPinsState(getTtsPins(story.id));
+  }, [story.id]);
+  const lastSpokenRef = useRef(null);
+  const lastTtsWriteRef = useRef(0);
+  function samePos(a, b) {
+    return a && b && a.chapterIndex === b.chapterIndex && a.charOffset === b.charOffset;
+  }
+  function posPreview(pos) {
+    const ch = pos && chapterAt(story, pos.chapterIndex);
+    const txt = ch && typeof ch.content === "string" ? ch.content.slice(pos.charOffset, pos.charOffset + 48).replace(/\s+/g, " ").trim() : "";
+    return txt ? txt + "…" : "";
+  }
+  // The spot the "last place" option refers to right now.
+  function currentLastPos() {
+    return lastSpokenRef.current || savedReadPos;
+  }
+  function togglePinLastPos() {
+    const pos = currentLastPos();
+    if (!pos) return;
+    const existing = ttsPins.find((p) => samePos(p, pos));
+    const next = existing
+      ? ttsPins.filter((p) => p !== existing)
+      : [...ttsPins, { id: String(Date.now()), chapterIndex: pos.chapterIndex, charOffset: pos.charOffset, preview: posPreview(pos), ts: Date.now() }].slice(-20);
+    setTtsPinsState(next);
+    setTtsPins(story.id, next);
+  }
+  function removePin(id) {
+    const next = ttsPins.filter((p) => p.id !== id);
+    setTtsPinsState(next);
+    setTtsPins(story.id, next);
+  }
+  function flushSpokenPosition() {
+    const pos = lastSpokenRef.current;
+    if (!pos) return;
+    lastTtsWriteRef.current = Date.now();
+    setTtsLastPos(story.id, pos.chapterIndex, pos.charOffset);
+  }
+  const flushSpokenPositionRef = useRef(flushSpokenPosition);
+  flushSpokenPositionRef.current = flushSpokenPosition;
+  useEffect(() => () => flushSpokenPositionRef.current(), []);
+  function noteSpokenPosition(absOffset) {
+    lastSpokenRef.current = { chapterIndex, charOffset: absOffset };
+    if (Date.now() - lastTtsWriteRef.current > 1500) flushSpokenPosition();
+  }
+  function openResumeMenu(e, mode) {
+    const rect = e && e.currentTarget ? e.currentTarget.getBoundingClientRect() : null;
+    const width = 250;
+    const left = rect ? Math.max(8, Math.min(window.innerWidth - width - 8, rect.left + rect.width / 2 - width / 2)) : 8;
+    const top = rect ? rect.bottom + 6 : 80;
+    setResumeMenu({ top, left, width, mode });
+  }
+  // "הקראה" pressed while idle: if this book has a remembered reading spot,
+  // offer to continue from it; otherwise just start as usual.
+  function requestPlay(e) {
+    if (!readAloudRef.current) return;
+    if (pendingWordResumeRef.current || !savedReadPos || !(savedReadPos.charOffset > 0) || !chapterAt(story, savedReadPos.chapterIndex)) {
+      readAloudRef.current.play();
+      return;
+    }
+    openResumeMenu(e, "idle");
+  }
+  function startFromSavedReadPos() {
+    startFromPos(savedReadPos);
+  }
+  function startFromPos(pos) {
+    if (!pos) return;
+    if (pos.chapterIndex !== chapterIndex) {
+      if (onSuppressNextScrollReset) onSuppressNextScrollReset();
+      onSelectChapter(pos.chapterIndex);
+    }
+    setPendingResume({ absoluteOffset: pos.charOffset, targetChapterIndex: pos.chapterIndex, thenPlay: true });
+  }
+  function requestResume(e) {
+    if (!readAloudRef.current) return;
+    // A word tapped while paused already says where to continue from.
+    if (pendingWordResumeRef.current) {
+      readAloudRef.current.resume();
+      return;
+    }
+    openResumeMenu(e, "paused");
+    return;
+  }
+  useEffect(() => {
+    setResumeMenu(null);
+  }, [readAloudStatus]);
   const [topControlsVisible, setTopControlsVisible] = useState(true);
   const topSentinelRef = useRef(null);
 
@@ -27994,7 +28145,7 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
         manualOffset != null ? Math.max(0, Math.min(pageText.length, manualOffset - pageBase)) : 0;
       const intro = relativeStart === 0 && pageIndex === 0 ? spokenArticleIntro() : "";
       lastIntroLengthRef.current = intro.length;
-      const heading = relativeStart === 0 && pageIndex === 0 ? spokenChapterHeading() : "";
+      const heading = relativeStart === 0 && pageIndex === 0 && !intro ? spokenChapterHeading() : "";
       const body = relativeStart > 0 ? pageText.slice(relativeStart) : pageText;
       lastHeadingLengthRef.current = heading.length;
       lastHeadingPrefixLenRef.current = heading ? chapterHeadingPrefixLen() : 0;
@@ -28019,7 +28170,7 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
     }
     const scrollIntro = startOffset === 0 ? spokenArticleIntro() : "";
     lastIntroLengthRef.current = scrollIntro.length;
-    const scrollHeading = startOffset === 0 ? spokenChapterHeading() : "";
+    const scrollHeading = startOffset === 0 && !scrollIntro ? spokenChapterHeading() : "";
     const bodyText = startOffset > 0 ? chapter.content.slice(startOffset) : chapter.content;
     lastHeadingLengthRef.current = scrollHeading.length;
     lastHeadingPrefixLenRef.current = scrollHeading ? chapterHeadingPrefixLen() : 0;
@@ -28053,12 +28204,17 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
     }
     setHeadingHighlightOffset(null);
     const bodyLocalOffset = offsetInSpokenText - headingLen;
-    const domOffset = paginated ? bodyLocalOffset : lastBaseOffsetRef.current + bodyLocalOffset;
+    const domOffset = lastBaseOffsetRef.current + bodyLocalOffset;
     setHighlightOffset(domOffset);
+    noteSpokenPosition(domOffset + (paginated ? pageStartOffset(pageIndex) : 0));
   }
 
   function handleReadAloudStatusChange(status) {
     setReadAloudStatus(status);
+    if (status !== "speaking") {
+      flushSpokenPosition();
+      setSavedReadPos(getTtsLastPos(story.id));
+    }
     if (status === "idle") {
       setHighlightOffset(null);
       setHeadingHighlightOffset(null);
@@ -28749,6 +28905,8 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
             onBoundary={handleWordBoundary}
             onStatusChange={handleReadAloudStatusChange}
             pendingManualResumeRef={pendingWordResumeRef}
+            onResumeRequest={requestResume}
+            onPlayRequest={requestPlay}
           />
         </div>
       </div>
@@ -29082,6 +29240,113 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
         />
       )}
 
+      {resumeMenu && resumeMenu.mode === readAloudStatus && (
+        <>
+          <div onClick={() => setResumeMenu(null)} style={{ position: "fixed", inset: 0, zIndex: 69 }} />
+          <div
+            dir="rtl"
+            style={{
+              position: "fixed",
+              top: resumeMenu.top,
+              left: resumeMenu.left,
+              width: resumeMenu.width,
+              zIndex: 70,
+              background: "var(--paper)",
+              border: `1.5px solid ${category.color}`,
+              borderRadius: 12,
+              boxShadow: "0 6px 22px rgba(0,0,0,0.28)",
+              overflow: "hidden",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "stretch", borderBottom: "1px solid var(--line)" }}>
+              <button
+                onClick={() => {
+                  // With pinned spots, open the small list to pick one; with none, just continue.
+                  if (ttsPins.length) {
+                    setResumeMenu((m) => (m ? { ...m, sub: !m.sub } : m));
+                    return;
+                  }
+                  setResumeMenu(null);
+                  if (resumeMenu.mode === "idle") startFromSavedReadPos();
+                  else if (readAloudRef.current) readAloudRef.current.resume();
+                }}
+                style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, padding: "11px 14px", background: "none", border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600, color: "var(--ink)", textAlign: "right" }}
+              >
+                <AppIcon name="History" size={14} color={category.color} />
+                המשך ממקום אחרון
+                {ttsPins.length > 0 && <AppIcon name={resumeMenu.sub ? "ChevronUp" : "ChevronDown"} size={13} color="#8a9089" />}
+              </button>
+              {currentLastPos() && (
+                <button
+                  onClick={togglePinLastPos}
+                  title={ttsPins.some((p) => samePos(p, currentLastPos())) ? "הסרת הנעיצה" : "נעיצת המקום האחרון"}
+                  aria-label="נעיצת המקום האחרון"
+                  style={{ background: "none", border: "none", borderRight: "1px solid var(--line)", cursor: "pointer", padding: "0 12px", display: "flex", alignItems: "center" }}
+                >
+                  <AppIcon name={ttsPins.some((p) => samePos(p, currentLastPos())) ? "PinFilled" : "Pin"} size={15} color={category.color} />
+                </button>
+              )}
+            </div>
+            {resumeMenu.sub && ttsPins.length > 0 && (
+              <div style={{ maxHeight: 220, overflowY: "auto", background: `${category.color}0d`, borderBottom: "1px solid var(--line)" }}>
+                {currentLastPos() && (
+                  <button
+                    onClick={() => {
+                      setResumeMenu(null);
+                      if (resumeMenu.mode === "idle") startFromSavedReadPos();
+                      else if (readAloudRef.current) readAloudRef.current.resume();
+                    }}
+                    style={{ display: "block", width: "100%", padding: "8px 14px", background: "none", border: "none", borderBottom: "1px solid var(--line)", cursor: "pointer", textAlign: "right" }}
+                  >
+                    <div style={{ fontSize: 12.5, fontWeight: 700, color: category.color }}>המקום האחרון</div>
+                    {posPreview(currentLastPos()) && (
+                      <div dir="ltr" style={{ fontSize: 12, color: "#5c665f", textAlign: "left", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{posPreview(currentLastPos())}</div>
+                    )}
+                  </button>
+                )}
+                {[...ttsPins].reverse().map((pin) => (
+                  <div key={pin.id} style={{ display: "flex", alignItems: "center", borderBottom: "1px solid var(--line)" }}>
+                    <button
+                      onClick={() => {
+                        setResumeMenu(null);
+                        startFromPos(pin);
+                      }}
+                      style={{ flex: 1, minWidth: 0, padding: "8px 14px", background: "none", border: "none", cursor: "pointer", textAlign: "right" }}
+                    >
+                      <div style={{ fontSize: 12.5, fontWeight: 700, color: category.color, display: "flex", alignItems: "center", gap: 5 }}>
+                        <AppIcon name="PinFilled" size={11} color={category.color} />
+                        {story.totalChapters > 1 ? `פרק ${pin.chapterIndex + 1}` : "נעוץ"}
+                      </div>
+                      {pin.preview && (
+                        <div dir="ltr" style={{ fontSize: 12, color: "#5c665f", textAlign: "left", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{pin.preview}</div>
+                      )}
+                    </button>
+                    <button
+                      onClick={() => removePin(pin.id)}
+                      title="מחיקת הנעיצה"
+                      aria-label="מחיקת הנעיצה"
+                      style={{ background: "none", border: "none", cursor: "pointer", padding: "8px 10px", color: "#8a9089" }}
+                    >
+                      <AppIcon name="Trash2" size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <button
+              onClick={() => {
+                setResumeMenu(null);
+                if (readAloudRef.current) readAloudRef.current.play();
+              }}
+              style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "11px 14px", background: "none", border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600, color: "var(--ink)", textAlign: "right" }}
+            >
+              <AppIcon name="Play" size={14} color={category.color} />
+              המשך ממקום נוכחי
+            </button>
+          </div>
+        </>
+      )}
+
       {navFabVisible && (
         <div
           style={{
@@ -29155,10 +29420,10 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
         >
           {showFloatingReadAloud && (
             <button
-              onClick={() => {
+              onClick={(e) => {
                 if (!readAloudRef.current) return;
                 if (readAloudStatus === "speaking") readAloudRef.current.pause();
-                else if (readAloudStatus === "paused") readAloudRef.current.resume();
+                else if (readAloudStatus === "paused") requestResume(e);
                 else readAloudRef.current.play();
               }}
               title={readAloudStatus === "speaking" ? "השהיה" : "המשך הקראה"}
