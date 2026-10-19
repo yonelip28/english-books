@@ -3782,6 +3782,51 @@ function compressJsonToField(value) {
   const bytes = new TextEncoder().encode(JSON.stringify(value));
   return strField(uint8ToBase64(pako.gzip(bytes, PDF_GZIP_OPTIONS)));
 }
+// A Firestore document is capped at about 1 MiB, and every story is saved as ONE
+// document. A story that carries many embedded pictures (an article with several
+// figures, a book with an illustration per chapter) can go past that, and Firestore
+// then rejects the whole write with "400" — so the backup fails on every attempt.
+// Pictures can be drawn again, so when the story is too big, the embedded picture
+// data is dropped step by step (the text is always kept) until it fits.
+const CLOUD_DOC_FIELD_LIMIT = 900000; // characters of base64 text, a safe margin under 1 MiB
+function compressStoryForCloud(story) {
+  let field = compressJsonToField(story);
+  if (field.stringValue.length <= CLOUD_DOC_FIELD_LIMIT || !story || !Array.isArray(story.chapters)) return field;
+  const isData = (v) => typeof v === "string" && v.startsWith("data:");
+  const stripFigures = (ch) =>
+    Array.isArray(ch.figures)
+      ? { ...ch, figures: ch.figures.map((f) => (f && isData(f.url) ? { ...f, url: null, status: "loading" } : f)) } // same offset / caption / drawing prompt kept: redrawn in the same spot when the article is opened
+      : ch;
+  // Step 1: the inline article figures.
+  let slim = { ...story, chapters: story.chapters.map((ch) => (ch ? stripFigures(ch) : ch)) };
+  field = compressJsonToField(slim);
+  if (field.stringValue.length <= CLOUD_DOC_FIELD_LIMIT) return field;
+  // Step 2: the chapter illustrations too. The exact drawing instructions
+  // (imagePrompt) stay in the record and are locked, so on restore the picture is
+  // drawn again from those very instructions, in the same place (the chapter header).
+  slim = {
+    ...slim,
+    chapters: slim.chapters.map((ch) =>
+      ch && isData(ch.image)
+        ? { ...ch, image: null, imageStatus: "loading", imageError: null, imagePromptLocked: !!ch.imagePrompt }
+        : ch
+    ),
+  };
+  field = compressJsonToField(slim);
+  if (field.stringValue.length <= CLOUD_DOC_FIELD_LIMIT) return field;
+  // Step 3: embedded PDF pictures. The text and the pictures' exact positions stay;
+  // the pictures themselves are cut back out of the original PDF (which is backed up
+  // separately) the first time the chapter is opened (see restoreStrippedPdfImages).
+  slim = {
+    ...slim,
+    chapters: slim.chapters.map((ch) =>
+      ch && Array.isArray(ch.pdfImages) && ch.pdfImages.length
+        ? { ...ch, pdfImages: undefined, pdfImagesStripped: true, pdfImageSlots: ch.pdfImages.map((im) => (im && im.offset != null ? im.offset : null)) }
+        : ch
+    ),
+  };
+  return compressJsonToField(slim);
+}
 // Reads back anything written by compressJsonToField — and, transparently,
 // anything written the OLD way too, as plain uncompressed JSON text, before
 // this compression existed. No migration needed: a valid gzip stream always
@@ -3925,10 +3970,16 @@ async function pushBackupFirebase(config, identity, state, onProgress) {
   if (newStoryIds.length && onProgress) onProgress(`מגבים ${newStoryIds.length} ספרים חדשים…`);
   for (let i = 0; i < newStoryIds.length; i++) {
     const id = newStoryIds[i];
-    const field = compressJsonToField(state.stories[id]);
-    await firestoreSet(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(id)}`, {
-      data: field,
-    });
+    const field = compressStoryForCloud(state.stories[id]);
+    try {
+      await firestoreSet(config, `${BACKUP_COLLECTION}/${docId}/stories/${encodeURIComponent(id)}`, {
+        data: field,
+      });
+    } catch (e) {
+      // Say WHICH book could not be saved, so a single bad one is easy to spot.
+      const t = state.stories[id] && (state.stories[id].storyTitle || state.stories[id].title);
+      throw new Error(`${(e && e.message) || "שגיאת שמירת גיבוי"}${t ? ` — בספר "${t}"` : ""}`);
+    }
     bytesWritten += field.stringValue.length;
   }
 
@@ -4729,7 +4780,7 @@ async function pushStoryToPublicLibrary(story) {
   }
   try {
     await firestoreSet(config, `${PUBLIC_LIBRARY_COLLECTION}/${encodeURIComponent(story.id)}`, {
-      data: compressJsonToField(story),
+      data: compressStoryForCloud(story),
       categoryId: strField(story.categoryId),
       level: intField(story.level || 1),
       storyTitle: strField(story.storyTitle || ""),
@@ -5738,6 +5789,37 @@ async function pushAllToPublicCatalog(state, onProgress) {
   }
 
   return { storiesPushed, wordsPushed };
+}
+
+// Automatic public sync — completely independent of the reader's PERSONAL
+// backup (which exists only so the reader can restore their own data).
+// Every public-eligible book and every saved word reaches the shared public
+// catalog / dictionary by itself, without waiting for the reader to back up
+// (or even to have backup configured). Safe to call as often as needed:
+//  * runs one pass at a time (a call during a running pass just schedules
+//    one more pass after it, so nothing added mid-pass is missed);
+//  * pushAllToPublicCatalog's own local tracking (chapter counts, word
+//    signatures, PDF flags) and the cloud-side dedup (PDF fingerprint,
+//    one doc per word key, one index entry per story id) mean content
+//    already shared is never re-uploaded or duplicated;
+//  * never throws and never shows an error to the reader.
+let PUBLIC_SYNC_RUNNING = false;
+let PUBLIC_SYNC_AGAIN = null;
+async function autoSyncPublicCatalog(state) {
+  if (!state || !publicLibraryAvailable()) return;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+  if (PUBLIC_SYNC_RUNNING) { PUBLIC_SYNC_AGAIN = state; return; }
+  PUBLIC_SYNC_RUNNING = true;
+  try {
+    await pushAllToPublicCatalog(state);
+  } catch (e) {
+    console.error("autoSyncPublicCatalog failed:", (e && e.message) || e);
+  } finally {
+    PUBLIC_SYNC_RUNNING = false;
+    const next = PUBLIC_SYNC_AGAIN;
+    PUBLIC_SYNC_AGAIN = null;
+    if (next) setTimeout(() => autoSyncPublicCatalog(next), 1500);
+  }
 }
 
 // ===== App.jsx =====
@@ -12285,7 +12367,7 @@ function buildLocalTranslationContext(meta, fallbackWord) {
 async function fetchWordExtras(word, translation, context) {
   const system =
     "You are a concise, precise English dictionary for a language learner. You will be given an English word/phrase, its Hebrew translation as used in one specific sentence (for reference only), and — when available — that exact sentence itself. Respond with ONLY valid JSON, no markdown fences, no commentary: " +
-    "{\"meaning\":\"a short English gloss (1-5 words) of EXACTLY the sense/meaning this word or phrase has in the given sentence — the same part of speech, and, if it is a phrasal verb or idiom, its true idiomatic meaning as a whole, never a word-by-word gloss of the parts. Do NOT default to the word's most common or most literal general meaning if that differs from how it is actually used here. Must not simply repeat the word/phrase itself.\"," +
+    "{\"meaning\":\"a short English gloss (1-5 words) of EXACTLY the sense/meaning this word or phrase has in the given sentence — the same part of speech, and, if it is a phrasal verb or idiom, its true idiomatic meaning as a whole, never a word-by-word gloss of the parts. Do NOT default to the word's most common or most literal general meaning if that differs from how it is actually used here. Must not simply repeat the word/phrase itself. It must be a real dictionary meaning of the word itself - the sentence only selects which of the word\'s real meanings applies, it never adds a meaning the word does not have.\"," +
     "\"example\":\"one short, simple, original English sentence (under 12 words) that uses the exact word or phrase with that SAME sense/meaning\"}. " +
     "If no usable sentence is given, fall back to the word's single most common general meaning instead.";
   const user = `Word/phrase: "${word}"\nHebrew translation as used in that sentence (for reference only): "${translation || ""}"\nExact sentence it appeared in: """${(context || "").slice(0, 500)}"""`;
@@ -12573,15 +12655,17 @@ async function translateWord(word, context, info) {
   // is made to name the part of speech / exact form of the marked word BEFORE it
   // gives the Hebrew, which is what keeps tense, number and meaning on target.
   const system =
-    "You translate ONE English word or phrase into Hebrew for a learner reading a story. You get the full sentence with the target marked as [[ ]]. Translate the marked words EXACTLY as they are used in THAT sentence.\n" +
+    "You translate ONE English word or phrase into Hebrew for a learner reading a story. You get the full sentence with the target marked as [[ ]]. Your Hebrew must be the correct translation OF THE MARKED WORDS THEMSELVES - not of the sentence, and not of a neighbouring word.\n" +
     "RULES\n" +
-    "1. Work out the part of speech and the exact form of the marked words from the whole sentence (subject, tense, number, active vs passive, verb vs noun vs adjective). Give the Hebrew in that same form and match the subject's number and gender. Examples: 'Soldiers shout' -> active present plural -> \"צועקים\" (NEVER a passive participle such as \"מצועקים\"); 'his brow furrowed' -> intransitive past verb -> \"התקמט\" and the noun 'brow' -> \"מצח\".\n" +
-    "2. Use the meaning that fits THIS sentence and the story. Never answer with a different word that merely looks similar (e.g. 'furrowed' is not 'rowdy'), and never a rare sense when a common one fits.\n" +
-    "3. A phrasal verb or idiom is ONE unit: give its natural Hebrew equivalent, never word-by-word.\n" +
-    "4. A name stays a Hebrew transliteration.\n" +
-    "5. Natural modern Hebrew, no nikud, nothing archaic or overly formal.\n" +
-    "6. Check: put your Hebrew back into the sentence - tense, number, gender and part of speech must fit.\n" +
-    "Reply with ONLY: <English part of speech and form, max 4 words> | <Hebrew, 1-4 words>   e.g.  verb, present plural | צועקים";
+    "1. WORD-LEVEL ACCURACY COMES FIRST. First decide what the marked word itself means in a dictionary (its real, established meanings). The Hebrew must be a genuine dictionary translation of THAT word. The sentence is used ONLY to choose between meanings the word really has; it never creates a meaning the word does not have and never overrides the word's true translation. If the sentence seems to 'suggest' something the word cannot mean, ignore that and translate the word.\n" +
+    "2. Translate the marked word, not the words around it. If the marked word is a noun that is modified by another word (e.g. in 'trumpeter swans' the target 'swans' -> \"ברבורים\", NOT \"חצוצרות\"; in 'sea lions' the target 'lions' -> \"אריות\"), translate only what is marked, in the right form. If the marked phrase is a fixed compound or a species/object name, give its real Hebrew name (e.g. 'trumpeter swan' -> \"ברבור חצוצרן\"), never a translation of just one part.\n" +
+    "3. Work out part of speech and exact form from the sentence (subject, tense, number, active vs passive, verb vs noun vs adjective) and give the Hebrew in that same form, matching number and gender. Examples: 'Soldiers shout' -> active present plural -> \"צועקים\" (NEVER a passive participle such as \"מצועקים\"); 'his brow furrowed' -> intransitive past verb -> \"התקמט\" and the noun 'brow' -> \"מצח\".\n" +
+    "4. Never answer with a different word that merely looks or sounds similar (e.g. 'furrowed' is not 'rowdy'), never an invented or unrelated meaning, and never a rare sense when a common sense fits.\n" +
+    "5. NEVER just write the English word as it sounds in Hebrew letters. Transliteration is allowed ONLY for real names of people and places (and for a loanword that truly has no Hebrew equivalent and is the normal Hebrew term). Common nouns, animals, plants, objects, verbs and adjectives must get their real Hebrew word.\n" +
+    "6. A phrasal verb or idiom is ONE unit: give its natural Hebrew equivalent, never word-by-word.\n" +
+    "7. Natural modern Hebrew, no nikud, nothing archaic or overly formal.\n" +
+    "8. Check twice: (a) is your Hebrew really a correct translation of the marked English word on its own, in a dictionary? (b) put it back into the sentence - tense, number, gender and part of speech must fit. If (a) fails, fix it even if it sounds good in the sentence.\n" +
+    "Reply with ONLY one line: <English part of speech and form, max 4 words> | <the marked word's plain dictionary meaning in English, 1-3 words> | <Hebrew, 1-4 words>   e.g.  noun, plural | swans | ברבורים   or   verb, present plural | shout | צועקים\n";
   // The exact sentence of the tapped word (found from the tapped token itself); the
   // text-search version is only the fallback for callers that don't have the token.
   const sentence = (info && info.sentence) || extractExactSentence(word, localTranslationContext(word, context));
@@ -12592,7 +12676,7 @@ async function translateWord(word, context, info) {
     `Sentence with the target marked:\n"""${shown}"""\n\nTarget: "${word}"`;
   // A few words at most: a small ceiling keeps the worst case cheap.
   try {
-    const raw = await callClaude(system, user, 70, undefined, undefined, { interactive: true });
+    const raw = await callClaude(system, user, 100, undefined, undefined, { interactive: true });
     const line = String(raw).trim().split("\n")[0];
     const answer = line.includes("|") ? line.slice(line.lastIndexOf("|") + 1) : line;
     return answer.trim().replace(/^["'\u05f4\u05f3\s]+|["'\u05f4\u05f3\s]+$/g, "");
@@ -14689,7 +14773,7 @@ function translationHintLine() {
 // translations in different senses, excluding the one already shown.
 async function fetchWordAlternatives(word, context, best) {
   const system =
-    "You are a precise English-Hebrew dictionary. Given an English word/phrase, the sentence it appears in, and the Hebrew translation already chosen for that sentence, list the OTHER Hebrew translations of this word, most important/common first (max 5, each 1-3 words, modern Hebrew, no nikud): (1) genuinely different senses; (2) derived or other-part-of-speech forms (e.g. the noun/adjective/verb form) as their own entries, even when it is not a brand-new meaning. Skip pure near-synonyms of the chosen translation. Mark a sense as minor:true when it is rare or marginal. If there is nothing else, return an empty list. Respond ONLY with a JSON array like [{\"t\":\"...\",\"minor\":false}].";
+    "You are a precise English-Hebrew dictionary. Given an English word/phrase, the sentence it appears in, and the Hebrew translation already chosen for that sentence, list the OTHER Hebrew translations of this word, most important/common first. Every entry must be a genuine dictionary translation of THE WORD ITSELF - never a translation of a neighbouring word, never an invented meaning, never the English word merely written in Hebrew letters (transliteration is only for real names). Do not pad the list: if the word has no other real senses, return an empty list (max 5, each 1-3 words, modern Hebrew, no nikud): (1) genuinely different senses; (2) derived or other-part-of-speech forms (e.g. the noun/adjective/verb form) as their own entries, even when it is not a brand-new meaning. Skip pure near-synonyms of the chosen translation. Mark a sense as minor:true when it is rare or marginal. If there is nothing else, return an empty list. Respond ONLY with a JSON array like [{\"t\":\"...\",\"minor\":false}].";
   const user = `Word/phrase: "${word}"\nSentence: """${extractExactSentence(word, context || word)}"""\nAlready chosen: "${best || ""}"`;
   const raw = await callClaude(system, user, 160, undefined, undefined, { interactive: true });
   let txt = raw.trim().replace(/^```json/i, "").replace(/^```/, "").replace(/```\s*$/, "").trim();
@@ -18843,6 +18927,19 @@ function App() {
       ensureArticleFigures(sid, idx);
     }
   }, [activeStoryId, activeChapterIndex, state && state.stories]);
+  // Imported-PDF chapters restored without their pictures: bring them back on open.
+  useEffect(() => {
+    const st = latestStateRef.current;
+    const sid = activeStoryId;
+    const story = sid && st && st.stories[sid];
+    const ch = story && story.chapters && story.chapters[activeChapterIndex];
+    if (ch && ch.pdfImagesStripped) restoreStrippedPdfImages(sid, activeChapterIndex);
+    // A restored chapter whose illustration was left out of the backup is drawn
+    // again right when it is opened, from its saved drawing instructions.
+    if (ch && ch.imagePromptLocked && ch.imageStatus === "loading" && !ch.image && ch.content) {
+      loadChapterImage(sid, activeChapterIndex, ch.imagePrompt || null, ch.content);
+    }
+  }, [activeStoryId, activeChapterIndex, state && state.stories]);
   latestStateRef.current = state;
   useEffect(() => {
     if (!ready) return;
@@ -18938,6 +19035,26 @@ function App() {
     }, 4000);
     return () => clearTimeout(cloudSyncTimer.current);
   }, [state, ready]);
+
+  // Automatic public sync: books and words go to the shared public catalog /
+  // dictionary on their own — shortly after every change, once on app load,
+  // and again when the connection comes back — never waiting for the
+  // reader's personal backup (that one is only for restoring their own data).
+  const latestStateRef = useRef(null);
+  latestStateRef.current = state;
+  const publicSyncTimer = useRef(null);
+  useEffect(() => {
+    if (!ready || !state) return;
+    if (publicSyncTimer.current) clearTimeout(publicSyncTimer.current);
+    publicSyncTimer.current = setTimeout(() => autoSyncPublicCatalog(state), 3000);
+    return () => clearTimeout(publicSyncTimer.current);
+  }, [state, ready]);
+  useEffect(() => {
+    if (!ready) return;
+    const onOnline = () => autoSyncPublicCatalog(latestStateRef.current);
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [ready]);
 
   // auto cloud restore, once per app load — as soon as the app is ready and
   // a backup identity (email or Google account) is configured, silently
@@ -19095,6 +19212,19 @@ function App() {
         }));
       }
     }
+    // A single-chapter item (article / poem) whose text was never written and is not
+    // being written right now is a leftover empty shell from a failed attempt:
+    // drop it and write a fresh one instead of re-running the same failure.
+    if (
+      target &&
+      !target.isImported &&
+      target.totalChapters === 1 &&
+      !(target.chapters || []).some((c) => c) &&
+      !loadingJobs.some((j) => !j.done && j.target && j.target.storyId === target.id)
+    ) {
+      discardEmptyShell(target.id);
+      target = null;
+    }
     if (target) {
       const s = target;
       let lastGenIdx = 0;
@@ -19167,6 +19297,37 @@ function App() {
     }
   }
 
+  // A book/article is saved as an empty "shell" before its text is written. If the
+  // writing then fails, that empty shell used to stay behind: "המשך קריאה" kept
+  // reopening it and re-running the same failing generation, and the reader never
+  // got a new article. This removes such a shell (only when NOTHING was written in
+  // it). Its subtopic stays in usedSubtopics, so the next try picks a different one.
+  function discardEmptyShell(storyId) {
+    const st = latestStateRef.current && latestStateRef.current.stories && latestStateRef.current.stories[storyId];
+    if (!st || st.isImported || (st.chapters || []).some((c) => c)) return;
+    const catId = st.categoryId;
+    setState((prev) => {
+      const cur = prev.stories[storyId];
+      if (!cur || (cur.chapters || []).some((c) => c)) return prev;
+      const stories = { ...prev.stories };
+      delete stories[storyId];
+      const p = { ...(prev.categoryProgress[catId] || {}) };
+      p.storyIds = (p.storyIds || []).filter((id) => id !== storyId);
+      if (p.currentStoryId === storyId) p.currentStoryId = null;
+      if (p.reopenId === storyId) delete p.reopenId;
+      return { ...prev, stories, categoryProgress: { ...prev.categoryProgress, [catId]: p } };
+    });
+    // The reader is looking at that empty page: send them back to the topic.
+    setActiveStoryId((cur) => {
+      if (cur === storyId) {
+        setHomeTabForCategory(catId);
+        setView("home");
+        return null;
+      }
+      return cur;
+    });
+  }
+
   async function createNewStory(catId, level) {
     const category = CAT_BY_ID[catId];
     const itemLabel = category.itemLabel || "סיפור";
@@ -19185,6 +19346,7 @@ function App() {
     const totalChapters = catId === "poetry" || catId === "articles" ? 1 : info.chapters;
     setLoadingContext(jobId, { category: { name: category.name, color: category.color, itemLabel }, level });
     setLoadingNote(jobId, null, estimateOutlineSeconds(totalChapters) + estimateChapterSeconds(info.wordsPerChapter));
+    let createdShellId = null;
     try {
       const progress = state.categoryProgress[catId];
       // Step 1: plan the book — small/fast call, no chapter content yet.
@@ -19218,6 +19380,7 @@ function App() {
       const source = `${plan.sourceWork || "מקור כללי"} — ${plan.sourceAuthor || "לא צוין"}`;
       const outline = plan.outline; // already sanitized to exactly totalChapters entries (or null for a single-chapter book)
       const storyId = uid();
+      createdShellId = storyId;
       const shellStory = {
         id: storyId,
         categoryId: catId,
@@ -19313,6 +19476,7 @@ function App() {
     } catch (e) {
       if (!withApiKeyGuard(e)) setErrorMsg(describeGenerationError(e, `לא הצלחנו ליצור ${itemLabel} חדש`));
       removeLoadingJob(jobId);
+      if (createdShellId) discardEmptyShell(createdShellId); // never leave an empty, unopenable shell behind
     } finally {
       activeJobIdsRef.current.delete(jobId);
     }
@@ -20281,9 +20445,10 @@ function App() {
       category: { name: category.name, color: category.color, itemLabel: category.itemLabel || "סיפור" },
       level: story.level,
       storyTitle: story.storyTitle,
-      chapterNumber: targetIndex + 1,
+      // An article/poem has no chapters: don't announce "chapter 1" for it.
+      chapterNumber: story.totalChapters > 1 ? targetIndex + 1 : null,
       totalChapters: story.totalChapters > 1 ? story.totalChapters : null,
-      chapterTitle: outlineEntry ? outlineEntry.title : null,
+      chapterTitle: outlineEntry && story.totalChapters > 1 ? outlineEntry.title : null,
     });
     setLoadingNote(jobId, null, estimateChapterSeconds(getLevelInfo(story.level).wordsPerChapter));
     setLoadingTarget(jobId, { storyId, chapterIndex: targetIndex });
@@ -20332,10 +20497,52 @@ function App() {
       finishLoadingSuccess(jobId, { storyId, chapterIndex: targetIndex }, story.storyTitle);
       maybePushStoryToPublicLibrary({ ...story, chapters: updatedChapters });
     } catch (e) {
-      if (!withApiKeyGuard(e)) setErrorMsg(describeGenerationError(e, "לא הצלחנו לטעון את הפרק"));
+      if (!withApiKeyGuard(e)) setErrorMsg(describeGenerationError(e, story.totalChapters > 1 ? "לא הצלחנו לטעון את הפרק" : `לא הצלחנו לכתוב את ${category.itemLabel || "הפריט"}`));
       removeLoadingJob(jobId);
+      if (story.totalChapters === 1) discardEmptyShell(storyId); // a single-chapter item with nothing written is just a broken shell
     } finally {
       activeJobIdsRef.current.delete(jobId);
+    }
+  }
+
+  // A chapter whose embedded PDF pictures were left out of the cloud backup (to fit
+  // Firestore's size limit) gets them back here: cut out of the ORIGINAL PDF again by
+  // the same extraction used at import, so they are the same pictures at the same
+  // positions in the text. If the PDF is not reachable yet, nothing changes and it is
+  // tried again the next time the chapter is opened.
+  async function restoreStrippedPdfImages(storyId, chapterIndex) {
+    const key = `pdfimg::${storyId}::${chapterIndex}`;
+    if (IMAGE_INFLIGHT.has(key)) return;
+    IMAGE_INFLIGHT.add(key);
+    try {
+      const story = latestStateRef.current && latestStateRef.current.stories[storyId];
+      const ch = story && story.chapters && story.chapters[chapterIndex];
+      if (!story || !ch || !ch.pdfImagesStripped) return;
+      let rawChapters = (await loadPdfRawChapters(storyId)) || [];
+      let rc = rawChapters[chapterIndex];
+      if (!rc || !(rc.images && rc.images.length)) {
+        let pdfBytes = story.isPublic ? await fetchPdfFileFromPublicCloud(storyId) : null;
+        if (!pdfBytes) pdfBytes = await fetchPdfFileFromPersonalBackup(storyId);
+        if (!pdfBytes) return;
+        savePdfFileBytes(storyId, pdfBytes);
+        const extracted = await extractPdfText(new Blob([pdfBytes], { type: "application/pdf" }));
+        rawChapters = splitPdfIntoChapters(extracted.pages, story.storyTitle);
+        savePdfRawChapters(storyId, rawChapters).catch(() => {});
+        rc = rawChapters[chapterIndex];
+      }
+      if (!rc || !(rc.images && rc.images.length)) return;
+      setState((prev) => {
+        const ps = prev.stories[storyId];
+        if (!ps || !ps.chapters[chapterIndex]) return prev;
+        const chapters = ps.chapters.slice();
+        const { pdfImagesStripped, pdfImageSlots, ...rest } = chapters[chapterIndex];
+        chapters[chapterIndex] = { ...rest, pdfImages: rc.images, imageStatus: "none" };
+        return { ...prev, stories: { ...prev.stories, [storyId]: { ...ps, chapters } } };
+      });
+    } catch (e) {
+      console.warn("Could not restore the PDF pictures yet:", (e && e.message) || e);
+    } finally {
+      IMAGE_INFLIGHT.delete(key);
     }
   }
 
@@ -20480,7 +20687,11 @@ function App() {
     // text-model request, the chapter text is never re-read). A model-written
     // imagePrompt is only used for old cached chapters that have no planned idea.
     const _sceneHint = quickSceneHint(storyId, chapterIndex);
-    let resolvedPrompt = _isArticleStory
+    const _chNow = _storyNow && _storyNow.chapters && _storyNow.chapters[chapterIndex];
+    const _lockedPrompt = _chNow && _chNow.imagePromptLocked && imagePrompt && imagePrompt.trim() ? imagePrompt.trim() : null;
+    let resolvedPrompt = _lockedPrompt
+      ? _lockedPrompt
+      : _isArticleStory
       ? articleHeroPrompt(_sceneHint.bookTitle, chapterContent)
       : _sceneHint.summary
       ? await describeSceneForImage(chapterContent, _sceneHint)
@@ -20595,7 +20806,19 @@ function App() {
   // that level. Existing stories at other levels are never touched.
   const [levelPickerCat, setLevelPickerCat] = useState(null); // catId | null
   function existingStoryAtLevel(catId, level) {
-    const list = Object.values(state.stories).filter((st) => st.categoryId === catId && st.level === level);
+    // An empty single-chapter shell (failed attempt, nothing being written) is not a
+    // real article at that level: skip it so picking the level writes a new one.
+    const list = Object.values(state.stories).filter(
+      (st) =>
+        st.categoryId === catId &&
+        st.level === level &&
+        !(
+          !st.isImported &&
+          st.totalChapters === 1 &&
+          !(st.chapters || []).some((c) => c) &&
+          !loadingJobs.some((j) => !j.done && j.target && j.target.storyId === st.id)
+        )
+    );
     if (!list.length) return null;
     const cur = state.categoryProgress[catId] && state.categoryProgress[catId].currentStoryId;
     const curStory = list.find((st) => st.id === cur);
@@ -20664,7 +20887,18 @@ function App() {
   const [levelStoryChoice, setLevelStoryChoice] = useState(null); // { level, candidates } | null
   function storiesAtLevel(catId, level) {
     return Object.values(state.stories)
-      .filter((s) => s.categoryId === catId && s.level === level)
+      .filter(
+        (s) =>
+          s.categoryId === catId &&
+          s.level === level &&
+          // an empty single-chapter shell from a failed attempt is not a real item to open
+          !(
+            !s.isImported &&
+            s.totalChapters === 1 &&
+            !(s.chapters || []).some((c) => c) &&
+            !loadingJobs.some((j) => !j.done && j.target && j.target.storyId === s.id)
+          )
+      )
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
   }
   function goToAdjacentLevelStory(direction) {
@@ -20899,18 +21133,25 @@ function App() {
     return (pageBaseOffset || 0) + tokens.slice(0, tokenIndex).join("").length;
   }
 
-  // If this exact word/phrase is already sitting in "המילים שלי" (saved from
-  // any story, any time), reuse that translation instead of asking the AI
-  // again — same word, same answer, no reason to spend a call on it twice.
-  // (Only when it is the SAME sentence: another sentence may need another form or sense.)
-  function findSavedWordTranslation(word, sentence) {
+  // If this word/phrase is already in "המילים שלי" / the dictionary (saved from
+  // any story, any time, or downloaded from the public dictionary), show that
+  // saved entry straight away: no AI call, no loading state, no tokens.
+  // A copy saved from this very sentence is preferred; otherwise the most
+  // recently saved copy of the word is used. Returns {translation, alternatives}.
+  function findSavedWordEntry(word, sentence) {
     const key = normWordKey(word);
-    if (!key || !sentence) return null;
-    const sig = sentenceSignature(sentence);
-    const match = Object.values(state.words).find(
-      (w) => normWordKey(w.word) === key && w.context && sentenceSignature(extractExactSentence(w.word, w.context)) === sig
-    );
-    return match ? match.translation : null;
+    if (!key) return null;
+    const copies = Object.values(state.words).filter((w) => normWordKey(w.word) === key && w.translation);
+    if (!copies.length) return null;
+    const sig = sentence ? sentenceSignature(sentence) : null;
+    const sameSentence = sig && copies.find((w) => w.context && sentenceSignature(extractExactSentence(w.word, w.context)) === sig);
+    const pick = sameSentence || copies[copies.length - 1];
+    const alts = (pick.alternatives && pick.alternatives.length ? pick.alternatives : null) || copies.map((w) => w.alternatives).find((l) => l && l.length) || null;
+    return { translation: pick.translation, alternatives: alts };
+  }
+  function findSavedWordTranslation(word, sentence) {
+    const m = findSavedWordEntry(word, sentence);
+    return m ? m.translation : null;
   }
 
   CURRENT_TRANSLATION_HINT = (activeStory && activeStory.storyTitle) || "";
@@ -20930,11 +21171,12 @@ function App() {
   }
   // Shows the word's other senses under the translation: from cache / saved
   // entry if known, otherwise one background lookup (cached afterwards).
-  function loadAlternatives(word, ctx, translation, pushPublic) {
+  function loadAlternatives(word, ctx, translation, pushPublic, cacheOnly) {
     const show = (list) => setPopup((p) => (p && p.word === word ? { ...p, alternatives: list } : p));
     const saved = Object.values(state.words).find((w) => senseKey(w.word) === senseKey(word) && w.alternatives && w.alternatives.length);
     const known = getWordAlternatives(word) || (saved && saved.alternatives);
     if (known) return show(known);
+    if (cacheOnly) return; // already-known words never trigger a new request
     if (word.trim().split(/\s+/).length > 3) return;
     fetchWordAlternatives(word, ctx, translation)
       .then((list) => {
@@ -20977,13 +21219,14 @@ function App() {
       const override = storySense(phraseText) ?? getCustomTranslation(phraseText);
       if (override != null) {
         setPopup((p) => (p && p.word === phraseText ? { ...p, loading: false, translation: override } : p));
-        loadAlternatives(phraseText, phraseSentence, override);
+        loadAlternatives(phraseText, phraseSentence, override, false, true);
         return;
       }
-      const savedTranslation = findSavedWordTranslation(phraseText, phraseSentence) ?? getCtxTranslation(phraseText, phraseSentence);
+      const savedEntry = findSavedWordEntry(phraseText, phraseSentence);
+      const savedTranslation = savedEntry ? savedEntry.translation : getCtxTranslation(phraseText, phraseSentence);
       if (savedTranslation != null) {
-        setPopup((p) => (p && p.word === phraseText ? { ...p, loading: false, translation: savedTranslation } : p));
-        loadAlternatives(phraseText, phraseSentence, savedTranslation);
+        setPopup((p) => (p && p.word === phraseText ? { ...p, loading: false, translation: savedTranslation, ...(savedEntry && savedEntry.alternatives ? { alternatives: savedEntry.alternatives } : {}) } : p));
+        loadAlternatives(phraseText, phraseSentence, savedTranslation, false, true);
         return;
       }
       translateWord(phraseText, phraseContext, phraseInfo)
@@ -21008,13 +21251,14 @@ function App() {
     const override = storySense(word) ?? getCustomTranslation(word);
     if (override != null) {
       setPopup((p) => (p && p.word === word ? { ...p, loading: false, translation: override } : p));
-      loadAlternatives(word, wordSentence, override);
+      loadAlternatives(word, wordSentence, override, false, true);
       return;
     }
-    const savedTranslation = findSavedWordTranslation(word, wordSentence) ?? getCtxTranslation(word, wordSentence);
+    const savedEntry = findSavedWordEntry(word, wordSentence);
+    const savedTranslation = savedEntry ? savedEntry.translation : getCtxTranslation(word, wordSentence);
     if (savedTranslation != null) {
-      setPopup((p) => (p && p.word === word ? { ...p, loading: false, translation: savedTranslation } : p));
-      loadAlternatives(word, wordSentence, savedTranslation);
+      setPopup((p) => (p && p.word === word ? { ...p, loading: false, translation: savedTranslation, ...(savedEntry && savedEntry.alternatives ? { alternatives: savedEntry.alternatives } : {}) } : p));
+      loadAlternatives(word, wordSentence, savedTranslation, false, true);
       return;
     }
     translateWordCached(word, wordContext, wordInfo)
@@ -26359,7 +26603,11 @@ function StoryLoadingPage({ story, category, chapterIndex, job, onBack }) {
   // shown here — this page covers a specific pick the reader hasn't
   // necessarily "arrived" at on purpose (e.g. a fresh surprise pick), and
   // both would spoil content they haven't reached yet.
-  const headline = job?.chapterNumber ? `כותבים את פרק ${job.chapterNumber.toLocaleString("he")}…` : "טוען…";
+  const headline = job?.chapterNumber
+    ? `כותבים את פרק ${job.chapterNumber.toLocaleString("he")}…`
+    : job?.storyTitle && job?.category?.itemLabel
+    ? `כותבים את ה${job.category.itemLabel}…`
+    : "טוען…";
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", marginBottom: 18 }}>
@@ -31287,7 +31535,7 @@ function LibraryView({ state, setState, onOpen, onRequestDelete }) {
 
   // A story can be flagged "public" locally (see storyIsPublic) long before
   // it actually lands in the shared Firestore catalog — that only happens
-  // once a cloud backup successfully runs (see pushAllToPublicCatalog). To
+  // automatically a few seconds after any change (see autoSyncPublicCatalog). To
   // show readers which of their public-eligible books haven't made it there
   // yet, fetch the real catalog once (same cost as browsing the public
   // library) and compare IDs — never blocks the list from rendering meanwhile.
