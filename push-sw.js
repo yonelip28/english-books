@@ -46,17 +46,33 @@ self.addEventListener("push", (event) => {
   } catch (e) {
     data = { body: event.data ? event.data.text() : "" };
   }
+  const isProgress = data.kind === "progress";
   event.waitUntil(
     (async () => {
+      const tag = data.tag || "book-ready";
+      if (isProgress) {
+        // Live "writing… 42%" updates are only for when the app is NOT on screen.
+        const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+        if (wins.some((c) => c.visibilityState === "visible")) {
+          const open = await self.registration.getNotifications({ tag });
+          open.forEach((n) => n.close());
+          return;
+        }
+      }
       const icon = (await makeTopicIcon(data.color)) || "/icon-192.png";
       await self.registration.showNotification(data.title || "הספר שלך מוכן 📖", {
         body: data.body || "הספר שביקשת נוצר ומחכה לך בספרייה.",
         icon,
-        badge: "/icon-192.png",
+        badge: "/badge-96.png", // monochrome white-on-transparent: Android shows it in the status bar
         dir: "rtl",
         lang: "he",
-        tag: data.tag || "book-ready",
-        data: { url: data.url || "/" },
+        // Same tag for the progress updates and the final "ready" message: the
+        // phone replaces the notification in place instead of stacking new ones.
+        tag,
+        // Progress updates are silent; the final message alerts (sound/vibration).
+        silent: isProgress,
+        renotify: !isProgress,
+        data: { url: data.url || "/", kind: data.kind || "done" },
       });
     })()
   );
@@ -64,13 +80,21 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const target = (event.notification.data && event.notification.data.url) || "/";
+  const target = new URL((event.notification.data && event.notification.data.url) || "/", self.location.origin);
+  const bookId = target.searchParams.get("book");
+  const chapterParam = target.searchParams.get("chapter");
+  const chapter = chapterParam !== null && chapterParam !== "" && !isNaN(Number(chapterParam)) ? Number(chapterParam) : undefined;
   event.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+      // The app is already open somewhere: bring it to the front and tell it which
+      // book to open. (If it is closed, the new window opens on /?book=ID instead.)
       for (const c of list) {
-        if ("focus" in c) return c.focus();
+        if ("focus" in c) {
+          if (bookId) c.postMessage({ type: "bg-open-book", bookId, chapter });
+          return c.focus();
+        }
       }
-      return self.clients.openWindow(target);
+      return self.clients.openWindow(target.href);
     })
   );
 });
