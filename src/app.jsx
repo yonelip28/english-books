@@ -21810,7 +21810,7 @@ const TOUR_SLIDES = [
                   items={[
                     { icon: "FileText", color: "#5E7F3A", title: "בנוי כמו מאמר אמיתי", body: "פתיחה שמציגה את הגילוי או השאלה, רקע, הראיות והדרך שבה יודעים אותן, ומה עדיין לא ידוע. במאמר ארוך יש כותרות משנה ותמונות לאורכו. האפליקציה בודקת כל מאמר ומסדרת אותו (פתיחה, פסקאות קצרות, כותרות משנה, סיום) לפני שהוא מוצג" },
                     { icon: "BarChart2", color: "#5E7F3A", title: "הרמה קובעת את הלשון", body: "כמו בשאר הנושאים: ברמה נמוכה הניסוח פשוט, וככל שהרמה עולה המאמר עשיר יותר באוצר מילים ובמשפטים מורכבים. את הרמה בוחרים בלחיצה על התג" },
-                    { icon: "ChevronLeft", color: "#5E7F3A", title: "המשך קריאה ומעבר בין מאמרים", body: "\"המשך קריאה\" פותח את המאמר האחרון שנוצר או נפתח. בראש המאמר יש כפתורי \"מאמר קודם\" ו\"מאמר הבא\", ומאמר חדש נוצר מהכפתורים בסוף המאמר או מבחירת רמה שעוד אין בה מאמר" },
+                    { icon: "ChevronLeft", color: "#5E7F3A", title: "המשך קריאה ומעבר בין מאמרים", body: "\"המשך קריאה\" פותח את המאמר האחרון שנוצר או נפתח. בראש המאמר ובסופו יש כפתורי \"מאמר קודם\" ו\"מאמר הבא\", ומאמר חדש נוצר מהכפתורים בסוף המאמר או מבחירת רמה שעוד אין בה מאמר" },
                     { icon: "Search", color: "#5E7F3A", title: "קוראים כמו כל טקסט", body: "אותו קורא של הסיפורים: לוחצים על מילה כדי לתרגם ושומרים אותה למילים שלי" },
                   ]}
                 />
@@ -28890,6 +28890,31 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
             <AppIcon name="RefreshCw" size={14} />
             נסה שוב
           </SecondaryButton>
+        </div>
+      )}
+
+      {atStoryEnd && story.categoryId === "articles" && !isSearchStory && (hasPreviousLevelStory || hasNextLevelStory) && (
+        <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+          {hasPreviousLevelStory && (
+            <PrimaryButton
+              onClick={onGoToPreviousLevel}
+              title="עבור למאמר הקודם"
+              style={{ flex: 1, minWidth: 0, background: category.color, justifyContent: "center" }}
+            >
+              <AppIcon name="ChevronRight" size={16} style={{ flexShrink: 0 }} />
+              מאמר קודם
+            </PrimaryButton>
+          )}
+          {hasNextLevelStory && (
+            <PrimaryButton
+              onClick={onGoToNextLevel}
+              title="עבור למאמר הבא"
+              style={{ flex: 1, minWidth: 0, background: category.color, justifyContent: "center" }}
+            >
+              מאמר הבא
+              <AppIcon name="ChevronLeft" size={16} style={{ flexShrink: 0 }} />
+            </PrimaryButton>
+          )}
         </div>
       )}
 
