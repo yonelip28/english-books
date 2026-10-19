@@ -686,6 +686,13 @@ const bgWait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // One chapter written for a book that is already in the library (= the second
 // half of writeChapterAt). Safe to apply twice.
+// An article whose saved body is empty or only a few words is a failed write, not a
+// finished article (e.g. the server returned nothing usable and the app cached it as
+// "done", leaving a page with a title and no text). Such a slot counts as NOT written.
+function articleBodyIsBroken(content) {
+  const words = String(content || "").trim().split(/\s+/).filter(Boolean).length;
+  return words < 40;
+}
 function applyDeliveredChapter(ctx, r) {
   const st = ctx.latestStateRef && ctx.latestStateRef.current;
   const story = st && st.stories && st.stories[r.storyId];
@@ -693,16 +700,26 @@ function applyDeliveredChapter(ctx, r) {
   if (story.categoryId === "articles" && r.chapter && typeof r.chapter.content === "string") {
     r.chapter = { ...r.chapter, content: normalizeArticleFormat(stripLeakedArticleInstructions(r.chapter.content)) };
   }
-  const hasIt = Array.isArray(story.chapters) && story.chapters[r.chapterIndex];
+  // Same safety net as for a delivered article book: if the server wrote a story
+  // instead of an article, don't keep it - the caller then writes it in the app.
+  if (story.categoryId === "articles" && r.chapter && typeof r.chapter.content === "string" && typeof looksLikeStoryNotArticle === "function" && looksLikeStoryNotArticle(r.chapter.content)) {
+    return false;
+  }
+  // An article that came back empty / near-empty is a failed write: don't save it
+  // (the caller then writes the article in the app instead of leaving a blank page).
+  if (story.categoryId === "articles" && (!r.chapter || articleBodyIsBroken(r.chapter.content))) return false;
+  const isBrokenArticleSlot = (c) => story.categoryId === "articles" && !!c && articleBodyIsBroken(c.content);
+  const hasIt = Array.isArray(story.chapters) && story.chapters[r.chapterIndex] && !isBrokenArticleSlot(story.chapters[r.chapterIndex]);
   if (!hasIt) {
-    const updatedChapters = r.hasOutline
+    const replaceSlot = r.hasOutline || isBrokenArticleSlot(story.chapters && story.chapters[r.chapterIndex]);
+    const updatedChapters = replaceSlot
       ? story.chapters.map((c, i) => (i === r.chapterIndex ? r.chapter : c))
       : [...story.chapters, r.chapter];
     ctx.setState((prev) => {
       const s = prev.stories[r.storyId];
       if (!s) return prev;
-      if (Array.isArray(s.chapters) && s.chapters[r.chapterIndex]) return prev;
-      const chapters = r.hasOutline ? s.chapters.map((c, i) => (i === r.chapterIndex ? r.chapter : c)) : [...s.chapters, r.chapter];
+      if (Array.isArray(s.chapters) && s.chapters[r.chapterIndex] && !isBrokenArticleSlot(s.chapters[r.chapterIndex])) return prev;
+      const chapters = replaceSlot ? s.chapters.map((c, i) => (i === r.chapterIndex ? r.chapter : c)) : [...s.chapters, r.chapter];
       return { ...prev, stories: { ...prev.stories, [s.id]: { ...s, chapters } } };
     });
     try {
@@ -829,9 +846,9 @@ async function startChapterViaBackend({ story, targetIndex }, ctx) {
     category: { name: category.name, color: category.color, itemLabel: category.itemLabel || "סיפור" },
     level: story.level,
     storyTitle: story.storyTitle,
-    chapterNumber: targetIndex + 1,
+    chapterNumber: story.totalChapters > 1 ? targetIndex + 1 : null,
     totalChapters: story.totalChapters > 1 ? story.totalChapters : null,
-    chapterTitle: outlineEntry ? outlineEntry.title : null,
+    chapterTitle: outlineEntry && story.totalChapters > 1 ? outlineEntry.title : null,
   });
   const est = estimateChapterSeconds(info.wordsPerChapter);
   setLoadingNote(jobId, null, est);
@@ -856,6 +873,10 @@ async function startChapterViaBackend({ story, targetIndex }, ctx) {
         bible: story.bible,
         storySoFar: collectStorySoFar(story, targetIndex),
         hasOutline,
+        // An article must be written with the article rules, as ONE piece (never as
+        // "chapter N of a story"): hand the server the same category object (with its
+        // style guide) that the book job already gets.
+        ...(story.categoryId === "articles" ? { category, isArticle: true } : {}),
       },
     });
     serverJobId = started.jobId;
@@ -964,7 +985,14 @@ function trackServerJob(ctx, opts) {
       if (!res.ok || !job) { await giveUp((job && job.error) || "תשובה לא תקינה מהשרת"); return; }
 
       if (job.status === "running") {
-        if (job.meta) setLoadingContext(jobId, job.meta); // book title, chapter number… like in-app
+        // A job that is still "running" after 15 minutes is stuck (busy or dead
+        // provider): stop waiting and write it in the app instead of hanging forever.
+        if (startedAt && Date.now() - startedAt > 15 * 60 * 1000) { await giveUp("השרת לא סיים בזמן סביר"); return; }
+        if (job.meta) {
+          // An article has no chapters: drop any "chapter N" the server put in its meta.
+          const m = catId === "articles" ? { ...job.meta, chapterNumber: null, totalChapters: null, chapterTitle: null } : job.meta;
+          setLoadingContext(jobId, m); // book title, chapter number… like in-app
+        }
         setLoadingNote(jobId, typeof job.progress === "string" ? job.progress : "מתקדמים…");
         setTimeout(poll, 4000);
         return;
@@ -20295,8 +20323,10 @@ function App() {
   async function writeChapterAt(storyId, targetIndex) {
     const story = state.stories[storyId];
     if (!story || targetIndex < 0 || targetIndex >= story.totalChapters) return;
-    if (chapterAt(story, targetIndex)) {
+    const _existingCh = chapterAt(story, targetIndex);
+    if (_existingCh && !(story.categoryId === "articles" && articleBodyIsBroken(_existingCh.content))) {
       // Already written and cached — just switch to it, no API call.
+      // (A saved article with an empty body is a failed write: it falls through and is written again.)
       setActiveChapterIndex(targetIndex);
       return;
     }
@@ -26566,7 +26596,8 @@ function LoadingBookArt({ color = "#23342E", size = 108 }) {
 // real passes (writing, word-count top-up, a final editorial review), the
 // wait is genuinely longer than it used to be, and the loading page should
 // say so plainly rather than leaving the reader staring at a bare spinner.
-function useLoadingSubtitle(startedAt) {
+function useLoadingSubtitle(startedAt, itemLabel) {
+  const the = itemLabel ? `ה${itemLabel}` : "הפרק";
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     if (!startedAt) return;
@@ -26576,8 +26607,8 @@ function useLoadingSubtitle(startedAt) {
   if (!startedAt) return "רק רגע…";
   const elapsed = (now - startedAt) / 1000;
   if (elapsed < 6) return "מתכננים את התוכן…";
-  if (elapsed < 18) return "כותבים את הפרק, שורה אחר שורה…";
-  if (elapsed < 32) return "הפרק ארוך ולוקח קצת זמן — רוצים שהוא יצא טוב…";
+  if (elapsed < 18) return `כותבים את ${the}, שורה אחר שורה…`;
+  if (elapsed < 32) return `${the} ארוך ולוקח קצת זמן — רוצים שהוא יצא טוב…`;
   return "כמעט מוכן…";
 }
 
@@ -26592,7 +26623,7 @@ function StoryLoadingPage({ story, category, chapterIndex, job, onBack }) {
   const estimateSeconds = job?.estimateSeconds ?? null;
   const startedAt = job?.startedAt ?? null;
   const { percent, remainingLabel } = useLoadingProgress(estimateSeconds, startedAt);
-  const subtitle = useLoadingSubtitle(startedAt);
+  const subtitle = useLoadingSubtitle(startedAt, job?.chapterNumber ? null : job?.category?.itemLabel);
   const accent = category?.color || "var(--ink, #23342E)";
   const ringSize = 72;
   const stroke = 5;
