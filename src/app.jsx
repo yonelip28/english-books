@@ -19068,8 +19068,7 @@ function App() {
   // dictionary on their own — shortly after every change, once on app load,
   // and again when the connection comes back — never waiting for the
   // reader's personal backup (that one is only for restoring their own data).
-  const latestStateRef = useRef(null);
-  latestStateRef.current = state;
+  // (latestStateRef is the one declared above, already updated on every render.)
   const publicSyncTimer = useRef(null);
   useEffect(() => {
     if (!ready || !state) return;
