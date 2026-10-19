@@ -27939,6 +27939,10 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
   const lastBaseOffsetRef = useRef(0);
   const [highlightOffset, setHighlightOffset] = useState(null);
   const [headingHighlightOffset, setHeadingHighlightOffset] = useState(null);
+  // Articles: the page-header title is read aloud first (when reading starts
+  // from the very beginning) and highlighted word by word while it is spoken.
+  const [titleHighlightOffset, setTitleHighlightOffset] = useState(null);
+  const lastIntroLengthRef = useRef(0);
   const [readAloudStatus, setReadAloudStatus] = useState("idle");
   const [topControlsVisible, setTopControlsVisible] = useState(true);
   const topSentinelRef = useRef(null);
@@ -27953,6 +27957,11 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
     if (!chapter.title) return 0;
     const alreadyNumbered = /^chapter\s+\S+\s*[:.\-–]/i.test(chapter.title.trim());
     return story.totalChapters > 1 && !alreadyNumbered ? `${chapterHeading(chapterIndex + 1)}. `.length : 0;
+  }
+
+  function spokenArticleIntro() {
+    if (story.categoryId !== "articles" || !story.storyTitle) return "";
+    return `${story.storyTitle}. `;
   }
 
   function spokenChapterHeading() {
@@ -27983,12 +27992,14 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
       const pageBase = pageStartOffset(pageIndex);
       const relativeStart =
         manualOffset != null ? Math.max(0, Math.min(pageText.length, manualOffset - pageBase)) : 0;
+      const intro = relativeStart === 0 && pageIndex === 0 ? spokenArticleIntro() : "";
+      lastIntroLengthRef.current = intro.length;
       const heading = relativeStart === 0 && pageIndex === 0 ? spokenChapterHeading() : "";
       const body = relativeStart > 0 ? pageText.slice(relativeStart) : pageText;
       lastHeadingLengthRef.current = heading.length;
       lastHeadingPrefixLenRef.current = heading ? chapterHeadingPrefixLen() : 0;
       lastBaseOffsetRef.current = relativeStart;
-      return `${heading}${body}`;
+      return `${intro}${heading}${body}`;
     }
     let startOffset = 0;
     if (manualOffset != null) {
@@ -28006,19 +28017,31 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
         }
       }
     }
+    const scrollIntro = startOffset === 0 ? spokenArticleIntro() : "";
+    lastIntroLengthRef.current = scrollIntro.length;
     const scrollHeading = startOffset === 0 ? spokenChapterHeading() : "";
     const bodyText = startOffset > 0 ? chapter.content.slice(startOffset) : chapter.content;
     lastHeadingLengthRef.current = scrollHeading.length;
     lastHeadingPrefixLenRef.current = scrollHeading ? chapterHeadingPrefixLen() : 0;
     lastBaseOffsetRef.current = startOffset;
-    return `${scrollHeading}${bodyText}`;
+    return `${scrollIntro}${scrollHeading}${bodyText}`;
   }
 
   // Called on every spoken word (best-effort — depends on the browser
   // supporting speechSynthesis word-boundary events). Maps the offset back
   // to a position in the currently-rendered text so the matching word can
   // be highlighted and scrolled into view.
-  function handleWordBoundary(offsetInSpokenText) {
+  function handleWordBoundary(rawOffsetInSpokenText) {
+    const introLen = lastIntroLengthRef.current;
+    if (rawOffsetInSpokenText < introLen) {
+      // Still reading the article title in the page header.
+      setHighlightOffset(null);
+      setHeadingHighlightOffset(null);
+      setTitleHighlightOffset(rawOffsetInSpokenText);
+      return;
+    }
+    setTitleHighlightOffset(null);
+    const offsetInSpokenText = rawOffsetInSpokenText - introLen;
     const headingLen = lastHeadingLengthRef.current;
     if (offsetInSpokenText < headingLen) {
       setHighlightOffset(null); // body not reached yet — still reading the heading
@@ -28039,6 +28062,7 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
     if (status === "idle") {
       setHighlightOffset(null);
       setHeadingHighlightOffset(null);
+      setTitleHighlightOffset(null);
     }
   }
 
@@ -28539,6 +28563,7 @@ function StoryView({ story, category, chapterIndex, setChapterIndex, onSelectCha
             savedWordsLower={savedWordsLower}
             onWordClick={onWordClick}
             phraseAnchor={phraseAnchor}
+            speakingOffset={titleHighlightOffset}
           />
         </div>
         <div style={{ fontStyle: "italic", color: "#5c665f", fontSize: 14, direction: "ltr", textAlign: "left", marginTop: 2 }}>
